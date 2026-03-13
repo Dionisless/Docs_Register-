@@ -352,7 +352,8 @@ class RegistrationApp(tk.Tk):
     def __init__(self, landocs_data: dict):
         super().__init__()
         self.landocs_data = landocs_data
-        self._preview_vars = {}  # StringVar-ы для полей из LanDocs
+        self._preview_vars = {}
+        self._default_filename = ''  # должно быть до _build_ui
 
         self.title("Регистрация входящей корреспонденции")
         self.resizable(True, False)
@@ -450,7 +451,7 @@ class RegistrationApp(tk.Tk):
 
         ttk.Button(btn_frame, text="Зарегистрировать в журнал",
                    command=self._on_register).pack(side='left', padx=6)
-        self._reparse_btn = ttk.Button(btn_frame, text="Запустить парсинг заново",
+        self._reparse_btn = ttk.Button(btn_frame, text="Запустить парсинг",
                                        command=self._start_reparse)
         self._reparse_btn.pack(side='left', padx=6)
         ttk.Button(btn_frame, text="Отмена",
@@ -640,45 +641,18 @@ def main():
         messagebox.showerror(
             "Не хватает зависимостей",
             "Не установлены библиотеки:\n  " + "\n  ".join(missing) +
-            "\n\nУстановите через pip или пересоберите .exe.\n"
-            "Продолжить в демо-режиме (без LanDocs)?",
-        )
-        if not HAS_WIN32:
-            # Демо-режим: показываем окно с пустыми полями
-            demo_data = {
-                'incoming_num': 'вх-XXXX',
-                'file_link':    '',
-                'correspondent': '',
-                'date':         datetime.today().strftime('%d.%m.%Y'),
-                'letter_num':   '',
-                'signatory':    '',
-                'subject':      '',
-                'related':      '',
-            }
-            app = RegistrationApp(demo_data)
-            app.mainloop()
-            return
-
-    # Небольшая пауза, чтобы пользователь успел переключиться в LanDocs
-    # (актуально при запуске через горячую клавишу из AutoHotkey)
-    time.sleep(0.4)
-
-    # Извлекаем данные из LanDocs
-    try:
-        landocs_data = extract_landocs_data()
-    except Exception as exc:
-        root = tk.Tk()
-        root.withdraw()
-        messagebox.showerror(
-            "Ошибка извлечения данных",
-            f"Не удалось прочитать данные из LanDocs:\n{exc}\n\n"
-            "Убедитесь, что окно регистрационной карточки активно\n"
-            "и курсор стоит в первом поле формы.",
+            "\n\nПересоберите .exe с нужными зависимостями.",
         )
         root.destroy()
         sys.exit(1)
 
-    app = RegistrationApp(landocs_data)
+    # Открываем окно сразу с пустыми полями.
+    # Парсинг запускается вручную кнопкой "Запустить парсинг".
+    empty_data = {
+        'incoming_num': '', 'file_link': '', 'correspondent': '',
+        'date': '', 'letter_num': '', 'signatory': '', 'subject': '', 'related': '',
+    }
+    app = RegistrationApp(empty_data)
     app.mainloop()
 
 
