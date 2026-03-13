@@ -10,20 +10,21 @@
 При запуске окно LanDocs должно быть активным, курсор — в поле 0 (первое поле формы).
 
 Позиции полей в форме LanDocs (количество нажатий Tab от начала):
-  0  — № вх
-  4  — ссылка на файл письма
-  5  — Корреспондент (часть "За подписью")
-  6  — Дата
-  7  — № письма
-  9  — Подписант (часть "За подписью")
-  11 — Тема письма
-  16 — Связанное письмо
+  0  — № вх   (читается через Tab→Shift+Tab для активации выделения)
+  3  — ссылка на файл письма
+  4  — Корреспондент (часть "За подписью")
+  5  — Дата
+  6  — № письма
+  8  — Подписант (часть "За подписью")
+  10 — Тема письма
+  15 — Связанное письмо
 """
 
 import os
 import re
 import sys
 import time
+import shutil
 import getpass
 import tkinter as tk
 from tkinter import ttk, filedialog, messagebox
@@ -97,6 +98,15 @@ def _send_tab():
     win32api.keybd_event(win32con.VK_TAB, 0, win32con.KEYEVENTF_KEYUP, 0)
 
 
+def _send_shift_tab():
+    if not HAS_WIN32:
+        return
+    win32api.keybd_event(win32con.VK_SHIFT, 0, 0, 0)
+    win32api.keybd_event(win32con.VK_TAB, 0, 0, 0)
+    win32api.keybd_event(win32con.VK_TAB, 0, win32con.KEYEVENTF_KEYUP, 0)
+    win32api.keybd_event(win32con.VK_SHIFT, 0, win32con.KEYEVENTF_KEYUP, 0)
+
+
 def _send_ctrl_a():
     if not HAS_WIN32:
         return
@@ -147,40 +157,46 @@ def extract_landocs_data() -> dict:
     current = 0
 
     # Позиция 0 — № вх
+    # Поле не выделяется Ctrl+A напрямую: делаем Tab вперёд, затем Shift+Tab обратно —
+    # после этого поле получает фокус с выделением.
+    _send_tab()
+    time.sleep(TAB_DELAY)
+    _send_shift_tab()
+    time.sleep(TAB_DELAY)
     data['incoming_num'] = read_current_field()
 
-    # → Позиция 4 — ссылка на файл письма
-    navigate_tabs(4 - current)
-    current = 4
+    # → Позиция 3 — ссылка на файл письма
+    navigate_tabs(3 - current)
+    current = 3
     data['file_link'] = read_current_field()
 
-    # → Позиция 5 — Корреспондент
-    navigate_tabs(5 - current)
-    current = 5
+    # → Позиция 4 — Корреспондент
+    navigate_tabs(4 - current)
+    current = 4
     data['correspondent'] = read_current_field()
 
-    # → Позиция 6 — Дата
-    navigate_tabs(6 - current)
-    current = 6
+    # → Позиция 5 — Дата
+    navigate_tabs(5 - current)
+    current = 5
     data['date'] = read_current_field()
 
-    # → Позиция 7 — № письма
-    navigate_tabs(7 - current)
-    current = 7
+    # → Позиция 6 — № письма
+    navigate_tabs(6 - current)
+    current = 6
     data['letter_num'] = read_current_field()
 
-    # → Позиция 9 — Подписант
-    navigate_tabs(9 - current)
-    current = 9
+    # → Позиция 8 — Подписант
+    navigate_tabs(8 - current)
+    current = 8
     data['signatory'] = read_current_field()
 
-    # → Позиция 11 — Тема письма
-    navigate_tabs(11 - current)
-    current = 11
+    # → Позиция 10 — Тема письма
+    navigate_tabs(10 - current)
+    current = 10
     data['subject'] = read_current_field()
 
-    # → Позиция 16 — Связанное письмо
-    navigate_tabs(16 - current)
+    # → Позиция 15 — Связанное письмо
+    navigate_tabs(15 - current)
     data['related'] = read_current_field()
 
     return data
@@ -495,8 +511,17 @@ class RegistrationApp(tk.Tk):
         else:
             signed_by = signatory
 
-        # Путь для гиперссылки = выбранный путь сохранения файла
+        # Копируем файл письма из LanDocs в выбранную папку
         hyperlink_path = self.save_path_var.get()
+        file_link = self.landocs_data.get('file_link', '')
+        if file_link and hyperlink_path:
+            if os.path.exists(file_link):
+                shutil.copy2(file_link, hyperlink_path)
+            else:
+                raise FileNotFoundError(
+                    f"Файл письма не найден:\n{file_link}\n\n"
+                    "Проверьте, что путь из LanDocs доступен с этого компьютера."
+                )
 
         row_data = {
             'date':           fmt_date_ymd(date_str),
