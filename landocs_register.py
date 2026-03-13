@@ -1,23 +1,29 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-Регистратор таблиц из LanDocs
-==============================
+Регистратор корреспонденции LanDocs
+=====================================
 Извлекает данные из регистрационной карточки LanDocs (через Tab-навигацию
 и буфер обмена) и записывает строку в журнал Excel.
 
-Запуск: через горячую клавишу (см. hotkey.ahk) или ярлык.
-При запуске окно LanDocs должно быть активным, курсор — в поле 0 (первое поле формы).
-
-Позиции полей в форме LanDocs (количество нажатий Tab от начала):
-  0  — № вх   (читается через Tab→Shift+Tab для активации выделения)
+Позиции полей ВХОДЯЩИХ (Tab от начала):
+  0  — № вх
   3  — ссылка на файл письма
-  4  — Корреспондент (часть "За подписью")
+  4  — Корреспондент
   5  — Дата
   6  — № письма
-  8  — Подписант (часть "За подписью")
+  8  — Подписант
   10 — Тема письма
   15 — Связанное письмо
+
+Позиции полей ИСХОДЯЩИХ (Tab от начала):
+  0  — № письма
+  1  — Дата
+  5  — Тема письма
+  6  — Исполнитель
+  9  — ФИО получателей (через ;)
+  10 — Компании получателей (через ;)
+  16 — Связанное письмо
 """
 
 import os
@@ -49,11 +55,12 @@ except ImportError:
 
 # ── Конфигурация ──────────────────────────────────────────────────────────────
 
-EXCEL_PATH = r"\\Prim-fs-serv\primrdu\СРЗА\Журнал регистрации корреспонденции\Журнал регистрации входящей документации.xlsx"
+EXCEL_PATH_IN  = r"\\Prim-fs-serv\primrdu\СРЗА\Журнал регистрации корреспонденции\Журнал регистрации входящей документации.xlsx"
+EXCEL_PATH_OUT = r"\\Prim-fs-serv\primrdu\СРЗА\Журнал регистрации корреспонденции\Журнал регистрации исходящей документации.xlsx"
 DEFAULT_SAVE_FOLDER = r"\\Prim-fs-serv\primrdu\СРЗА\Дела СРЗА\19 Переписка"
 
 # Задержка между нажатиями Tab (сек) — увеличьте если LanDocs тормозит
-TAB_DELAY = 0.07
+TAB_DELAY  = 0.07
 # Задержка после Ctrl+C перед чтением буфера обмена (сек)
 COPY_DELAY = 0.12
 
@@ -145,61 +152,94 @@ def navigate_tabs(n: int):
 
 # ── Извлечение данных из LanDocs ──────────────────────────────────────────────
 
-def extract_landocs_data() -> dict:
+def extract_landocs_data_in() -> dict:
     """
-    Извлекает поля из открытой регистрационной карточки LanDocs.
-    Курсор должен быть установлен в первое поле формы (позиция 0).
-    Возвращает словарь с ключами:
-      incoming_num, file_link, correspondent, date,
-      letter_num, signatory, subject, related
+    Извлекает поля из карточки ВХОДЯЩЕГО письма.
+    Курсор должен быть в первом поле формы (позиция 0).
     """
     data = {}
     current = 0
 
-    # Позиция 0 — № вх
-    # Поле не выделяется Ctrl+A напрямую: делаем Tab вперёд, затем Shift+Tab обратно —
-    # после этого поле получает фокус с выделением.
+    # Позиция 0 — № вх (Tab вперёд + Shift+Tab для активации выделения)
     _send_tab()
     time.sleep(TAB_DELAY)
     _send_shift_tab()
     time.sleep(TAB_DELAY)
     data['incoming_num'] = read_current_field()
 
-    # → Позиция 3 — ссылка на файл письма
-    navigate_tabs(3 - current)
-    current = 3
+    navigate_tabs(3 - current); current = 3
     data['file_link'] = read_current_field()
 
-    # → Позиция 4 — Корреспондент
-    navigate_tabs(4 - current)
-    current = 4
+    navigate_tabs(4 - current); current = 4
     data['correspondent'] = read_current_field()
 
-    # → Позиция 5 — Дата
-    navigate_tabs(5 - current)
-    current = 5
+    navigate_tabs(5 - current); current = 5
     data['date'] = read_current_field()
 
-    # → Позиция 6 — № письма
-    navigate_tabs(6 - current)
-    current = 6
+    navigate_tabs(6 - current); current = 6
     data['letter_num'] = read_current_field()
 
-    # → Позиция 8 — Подписант
-    navigate_tabs(8 - current)
-    current = 8
+    navigate_tabs(8 - current); current = 8
     data['signatory'] = read_current_field()
 
-    # → Позиция 10 — Тема письма
-    navigate_tabs(10 - current)
-    current = 10
+    navigate_tabs(10 - current); current = 10
     data['subject'] = read_current_field()
 
-    # → Позиция 15 — Связанное письмо
     navigate_tabs(15 - current)
     data['related'] = read_current_field()
 
     return data
+
+
+def extract_landocs_data_out() -> dict:
+    """
+    Извлекает поля из карточки ИСХОДЯЩЕГО письма.
+    Курсор должен быть в первом поле формы (позиция 0).
+    """
+    data = {}
+    current = 0
+
+    # Позиция 0 — № письма
+    _send_tab()
+    time.sleep(TAB_DELAY)
+    _send_shift_tab()
+    time.sleep(TAB_DELAY)
+    data['letter_num'] = read_current_field()
+
+    navigate_tabs(1 - current); current = 1
+    data['date'] = read_current_field()
+
+    navigate_tabs(5 - current); current = 5
+    data['subject'] = read_current_field()
+
+    navigate_tabs(6 - current); current = 6
+    data['executor'] = read_current_field()
+
+    navigate_tabs(9 - current); current = 9
+    data['recipient_names'] = read_current_field()
+
+    navigate_tabs(10 - current); current = 10
+    data['recipient_companies'] = read_current_field()
+
+    navigate_tabs(16 - current)
+    data['related'] = read_current_field()
+
+    return data
+
+
+def build_recipient_string(names_str: str, companies_str: str) -> str:
+    """
+    Объединяет списки ФИО и компаний в одну строку для Excel.
+    Формат: "1. ФИО1 Компания1;\n2. ФИО2 Компания2"
+    """
+    names     = [n.strip() for n in names_str.split(';') if n.strip()]
+    companies = [c.strip() for c in companies_str.split(';') if c.strip()]
+    parts = []
+    for i, (n, c) in enumerate(zip(names, companies), 1):
+        parts.append(f"{i}. {n} {c}")
+    if not parts:
+        return names_str  # fallback если компании не распознались
+    return ';\n'.join(parts)
 
 
 # ── Поиск файла письма в ViewDir ─────────────────────────────────────────────
@@ -208,7 +248,6 @@ def find_latest_in_viewdir() -> str:
     """
     Возвращает полный путь к самому новому файлу в папке
     %LOCALAPPDATA%\\Temp\\ViewDir (и её подпапках).
-    Именно туда LanDocs временно кладёт открытый файл письма.
     """
     local_app = os.environ.get('LOCALAPPDATA') or os.path.join(
         os.environ.get('USERPROFILE', ''), 'AppData', 'Local')
@@ -251,21 +290,32 @@ def fmt_date_ymd(date_str: str) -> str:
     return dt.strftime('%Y-%m-%d') if dt else date_str
 
 
+def fmt_date_dmy(date_str: str) -> str:
+    """Форматирует дату в dd.mm.yyyy."""
+    dt = parse_date(date_str)
+    return dt.strftime('%d.%m.%Y') if dt else date_str
+
+
 def fmt_date_dmy_underscore(date_str: str) -> str:
     """Форматирует дату в dd_mm_yyyy."""
     dt = parse_date(date_str)
     return dt.strftime('%d_%m_%Y') if dt else re.sub(r'[.\-/]', '_', date_str)
 
 
-def build_default_filename(date_str: str, incoming_num: str, letter_num: str) -> str:
-    """
-    Формирует имя файла по шаблону:
-      [yyyy-mm-dd] [№вх]_[№письма_очищенный]_[dd_mm_yyyy]
-    """
+def build_default_filename_in(date_str: str, incoming_num: str, letter_num: str) -> str:
+    """Имя файла для входящего: [yyyy-mm-dd] [№вх]_[№письма]_[dd_mm_yyyy]"""
     date_ymd = fmt_date_ymd(date_str)
     date_dmy = fmt_date_dmy_underscore(date_str)
     letter_clean = sanitize_for_filename(letter_num)
     return f"{date_ymd} {incoming_num}_{letter_clean}_{date_dmy}"
+
+
+def build_default_filename_out(date_str: str, letter_num: str) -> str:
+    """Имя файла для исходящего: [yyyy-mm-dd] [№письма]_[dd_mm_yyyy]"""
+    date_ymd = fmt_date_ymd(date_str)
+    date_dmy = fmt_date_dmy_underscore(date_str)
+    letter_clean = sanitize_for_filename(letter_num)
+    return f"{date_ymd} {letter_clean}_{date_dmy}"
 
 
 def calc_folder_num(full_path: str) -> str:
@@ -280,85 +330,125 @@ def calc_folder_num(full_path: str) -> str:
     return norm
 
 
-# ── Запись в Excel ────────────────────────────────────────────────────────────
+# ── Запись в Excel — Входящие ─────────────────────────────────────────────────
 
-def write_to_excel(row_data: dict):
+def write_to_excel_in(row_data: dict):
     """
-    Добавляет строку в конец последнего листа журнала Excel.
-    row_data — словарь с полями:
-      date, incoming_num, letter_num, subject, author,
-      signed_by, folder_num, keywords, related, hyperlink_path
+    Добавляет строку входящего письма в журнал.
+    Колонки: Дата | № вх | № письма | Тема | Автор | За подписью | № папки | Кто рег. | Ключ. слова | Связанное
     """
     if not HAS_OPENPYXL:
         raise RuntimeError("Библиотека openpyxl не установлена.")
+    if not os.path.exists(EXCEL_PATH_IN):
+        raise FileNotFoundError(f"Файл журнала не найден:\n{EXCEL_PATH_IN}")
 
-    if not os.path.exists(EXCEL_PATH):
-        raise FileNotFoundError(f"Файл журнала не найден:\n{EXCEL_PATH}")
+    wb = openpyxl.load_workbook(EXCEL_PATH_IN)
+    ws = wb.worksheets[-1]
 
-    wb = openpyxl.load_workbook(EXCEL_PATH)
-    ws = wb.worksheets[-1]  # последний лист
-
-    # Найти первую пустую строку (по столбцу A)
     last_row = ws.max_row
     while last_row > 1 and ws.cell(row=last_row, column=1).value is None:
         last_row -= 1
     new_row = last_row + 1
 
-    # A — Дата (yyyy-mm-dd)
     ws.cell(row=new_row, column=1).value = row_data['date']
 
-    # B — № вх
     ws.cell(row=new_row, column=2).value = row_data['incoming_num']
 
-    # C — № письма (с гиперссылкой на файл письма)
     cell_letter = ws.cell(row=new_row, column=3)
     cell_letter.value = row_data['letter_num']
     if row_data.get('hyperlink_path'):
         cell_letter.hyperlink = row_data['hyperlink_path']
         cell_letter.style = 'Hyperlink'
 
-    # D — Тема письма
     ws.cell(row=new_row, column=4).value = row_data['subject']
 
-    # E — Автор письма
     ws.cell(row=new_row, column=5).value = row_data['author']
 
-    # F — За подписью (Подписант + перенос строки + Корреспондент)
     cell_signed = ws.cell(row=new_row, column=6)
     cell_signed.value = row_data['signed_by']
     cell_signed.alignment = Alignment(wrap_text=True)
 
-    # G — № папки
     ws.cell(row=new_row, column=7).value = row_data['folder_num']
 
-    # H — Кто регистрировал (имя пользователя Windows)
     ws.cell(row=new_row, column=8).value = row_data['who_registered']
 
-    # I — Ключевые слова
     ws.cell(row=new_row, column=9).value = row_data['keywords']
 
-    # J — Связанное письмо
     ws.cell(row=new_row, column=10).value = row_data['related']
 
-    wb.save(EXCEL_PATH)
-    # Файл не закрывается — по требованию ТЗ
+    wb.save(EXCEL_PATH_IN)
+
+
+# ── Запись в Excel — Исходящие ────────────────────────────────────────────────
+
+def write_to_excel_out(row_data: dict):
+    """
+    Добавляет строку исходящего письма в журнал.
+    Колонки: Дата | № письма | Тема | Получатель | Исполнитель | Ключ. слова | Связанное | Контроль
+    """
+    if not HAS_OPENPYXL:
+        raise RuntimeError("Библиотека openpyxl не установлена.")
+    if not os.path.exists(EXCEL_PATH_OUT):
+        raise FileNotFoundError(f"Файл журнала не найден:\n{EXCEL_PATH_OUT}")
+
+    wb = openpyxl.load_workbook(EXCEL_PATH_OUT)
+    ws = wb.worksheets[-1]
+
+    last_row = ws.max_row
+    while last_row > 1 and ws.cell(row=last_row, column=1).value is None:
+        last_row -= 1
+    new_row = last_row + 1
+
+    # A — Дата (dd.mm.yyyy)
+    ws.cell(row=new_row, column=1).value = row_data['date']
+
+    # B — № письма (с гиперссылкой)
+    cell_letter = ws.cell(row=new_row, column=2)
+    cell_letter.value = row_data['letter_num']
+    if row_data.get('hyperlink_path'):
+        cell_letter.hyperlink = row_data['hyperlink_path']
+        cell_letter.style = 'Hyperlink'
+
+    # C — Тема письма
+    ws.cell(row=new_row, column=3).value = row_data['subject']
+
+    # D — Получатель (ФИО + Компания)
+    cell_recip = ws.cell(row=new_row, column=4)
+    cell_recip.value = row_data['recipient']
+    cell_recip.alignment = Alignment(wrap_text=True)
+
+    # E — Исполнитель
+    ws.cell(row=new_row, column=5).value = row_data['executor']
+
+    # F — Ключевые слова
+    ws.cell(row=new_row, column=6).value = row_data['keywords']
+
+    # G — Связанное письмо
+    ws.cell(row=new_row, column=7).value = row_data['related']
+
+    # H — Контроль
+    ws.cell(row=new_row, column=8).value = row_data['control']
+
+    wb.save(EXCEL_PATH_OUT)
 
 
 # ── Диалоговое окно ───────────────────────────────────────────────────────────
 
 class RegistrationApp(tk.Tk):
-    """Главное окно программы."""
+    """Главное окно программы с двумя вкладками: Входящие / Исходящие."""
 
-    def __init__(self, landocs_data: dict):
+    def __init__(self):
         super().__init__()
-        self.landocs_data = landocs_data
-        self._preview_vars = {}
-        self._default_filename = ''  # должно быть до _build_ui
+        self.in_data  = {}
+        self.out_data = {}
+        self._in_preview_vars  = {}
+        self._out_preview_vars = {}
+        self._default_filename_in  = ''
+        self._default_filename_out = ''
 
-        self.title("Регистрация входящей корреспонденции")
+        self.title("Регистрация корреспонденции")
         self.resizable(True, False)
         self._build_ui()
-        self._apply_landocs_data()
         self._center_window()
 
     # ── Построение интерфейса ──────────────────────────────────────────────
@@ -369,85 +459,26 @@ class RegistrationApp(tk.Tk):
         self.columnconfigure(0, weight=1)
         root_frame.columnconfigure(0, weight=1)
 
-        # --- Данные из LanDocs (только для просмотра) ---
-        info_frame = ttk.LabelFrame(root_frame, text="Данные из LanDocs", padding=8)
-        info_frame.grid(row=0, column=0, sticky='ew', pady=(0, 8))
-        info_frame.columnconfigure(1, weight=1)
+        # Notebook с двумя вкладками
+        self._notebook = ttk.Notebook(root_frame)
+        self._notebook.grid(row=0, column=0, sticky='ew', pady=(0, 8))
 
-        preview_fields = [
-            ("Дата:",             'date'),
-            ("№ вх:",             'incoming_num'),
-            ("№ письма:",         'letter_num'),
-            ("Тема письма:",      'subject'),
-            ("Подписант:",        'signatory'),
-            ("Корреспондент:",    'correspondent'),
-            ("Связанное письмо:", 'related'),
-        ]
-        for i, (label, key) in enumerate(preview_fields):
-            ttk.Label(info_frame, text=label, anchor='e').grid(
-                row=i, column=0, sticky='e', padx=(0, 6), pady=2)
-            var = tk.StringVar()
-            self._preview_vars[key] = var
-            ttk.Label(info_frame, textvariable=var,
-                      anchor='w', wraplength=460).grid(
-                row=i, column=1, sticky='w', pady=2)
+        in_tab  = ttk.Frame(self._notebook, padding=8)
+        out_tab = ttk.Frame(self._notebook, padding=8)
+        self._notebook.add(in_tab,  text="  Входящие  ")
+        self._notebook.add(out_tab, text="  Исходящие  ")
 
-        # --- Поля для заполнения пользователем ---
-        input_frame = ttk.LabelFrame(root_frame, text="Данные для регистрации", padding=8)
-        input_frame.grid(row=1, column=0, sticky='ew', pady=(0, 8))
-        input_frame.columnconfigure(1, weight=1)
+        self._build_incoming_tab(in_tab)
+        self._build_outgoing_tab(out_tab)
 
-        # Автор письма
-        ttk.Label(input_frame, text="Автор письма:").grid(
-            row=0, column=0, sticky='e', padx=(0, 6), pady=4)
-        self.author_var = tk.StringVar(value="-")
-        ttk.Entry(input_frame, textvariable=self.author_var, width=48).grid(
-            row=0, column=1, sticky='ew', pady=4)
-
-        # Ключевые слова
-        ttk.Label(input_frame, text="Ключевые слова:").grid(
-            row=1, column=0, sticky='e', padx=(0, 6), pady=4)
-        self.keywords_var = tk.StringVar(value="")
-        ttk.Entry(input_frame, textvariable=self.keywords_var, width=48).grid(
-            row=1, column=1, sticky='ew', pady=4)
-
-        # Название файла
-        ttk.Label(input_frame, text="Название файла:").grid(
-            row=2, column=0, sticky='e', padx=(0, 6), pady=4)
-        self.filename_var = tk.StringVar(value=self._default_filename)
-        ttk.Entry(input_frame, textvariable=self.filename_var, width=48).grid(
-            row=2, column=1, sticky='ew', pady=4)
-
-        # Папка сохранения + кнопка
-        ttk.Label(input_frame, text="Папка сохранения:").grid(
-            row=3, column=0, sticky='e', padx=(0, 6), pady=4)
-        folder_row = ttk.Frame(input_frame)
-        folder_row.grid(row=3, column=1, sticky='ew', pady=4)
-        folder_row.columnconfigure(0, weight=1)
-
-        self.save_path_var = tk.StringVar(value="")
-        ttk.Entry(folder_row, textvariable=self.save_path_var,
-                  state='readonly', width=38).grid(row=0, column=0, sticky='ew')
-        ttk.Button(folder_row, text="Выбрать папку…",
-                   command=self._choose_save_folder).grid(
-            row=0, column=1, padx=(6, 0))
-
-        # № папки (вычисляется автоматически)
-        ttk.Label(input_frame, text="№ папки:").grid(
-            row=4, column=0, sticky='e', padx=(0, 6), pady=4)
-        self.folder_num_var = tk.StringVar(value="")
-        ttk.Label(input_frame, textvariable=self.folder_num_var,
-                  anchor='w', wraplength=460, foreground='navy').grid(
-            row=4, column=1, sticky='w', pady=4)
-
-        # --- Статус парсинга ---
+        # Статус парсинга (общий)
         self._reparse_status = tk.StringVar(value="")
         ttk.Label(root_frame, textvariable=self._reparse_status,
-                  foreground='gray').grid(row=2, column=0, pady=(0, 2))
+                  foreground='gray').grid(row=1, column=0, pady=(0, 2))
 
-        # --- Кнопки ---
+        # Кнопки (общие)
         btn_frame = ttk.Frame(root_frame)
-        btn_frame.grid(row=3, column=0, pady=4)
+        btn_frame.grid(row=2, column=0, pady=4)
 
         ttk.Button(btn_frame, text="Зарегистрировать в журнал",
                    command=self._on_register).pack(side='left', padx=6)
@@ -457,27 +488,173 @@ class RegistrationApp(tk.Tk):
         ttk.Button(btn_frame, text="Отмена",
                    command=self.destroy).pack(side='left', padx=6)
 
-    # ── Обновление данных из LanDocs ──────────────────────────────────────
+    def _build_incoming_tab(self, frame):
+        frame.columnconfigure(1, weight=1)
 
-    def _apply_landocs_data(self):
-        """Заполняет preview-метки и обновляет имя файла по умолчанию."""
-        d = self.landocs_data
-        for key, var in self._preview_vars.items():
+        # Данные из LanDocs
+        info = ttk.LabelFrame(frame, text="Данные из LanDocs", padding=8)
+        info.grid(row=0, column=0, sticky='ew', pady=(0, 8))
+        info.columnconfigure(1, weight=1)
+
+        fields = [
+            ("Дата:",             'date'),
+            ("№ вх:",             'incoming_num'),
+            ("№ письма:",         'letter_num'),
+            ("Тема письма:",      'subject'),
+            ("Подписант:",        'signatory'),
+            ("Корреспондент:",    'correspondent'),
+            ("Связанное письмо:", 'related'),
+        ]
+        for i, (label, key) in enumerate(fields):
+            ttk.Label(info, text=label, anchor='e').grid(
+                row=i, column=0, sticky='e', padx=(0, 6), pady=2)
+            var = tk.StringVar()
+            self._in_preview_vars[key] = var
+            ttk.Label(info, textvariable=var, anchor='w', wraplength=460).grid(
+                row=i, column=1, sticky='w', pady=2)
+
+        # Данные для регистрации
+        inp = ttk.LabelFrame(frame, text="Данные для регистрации", padding=8)
+        inp.grid(row=1, column=0, sticky='ew')
+        inp.columnconfigure(1, weight=1)
+
+        ttk.Label(inp, text="Автор письма:").grid(
+            row=0, column=0, sticky='e', padx=(0, 6), pady=4)
+        self.in_author_var = tk.StringVar(value="-")
+        ttk.Entry(inp, textvariable=self.in_author_var, width=48).grid(
+            row=0, column=1, sticky='ew', pady=4)
+
+        ttk.Label(inp, text="Ключевые слова:").grid(
+            row=1, column=0, sticky='e', padx=(0, 6), pady=4)
+        self.in_keywords_var = tk.StringVar(value="")
+        ttk.Entry(inp, textvariable=self.in_keywords_var, width=48).grid(
+            row=1, column=1, sticky='ew', pady=4)
+
+        ttk.Label(inp, text="Название файла:").grid(
+            row=2, column=0, sticky='e', padx=(0, 6), pady=4)
+        self.in_filename_var = tk.StringVar(value="")
+        ttk.Entry(inp, textvariable=self.in_filename_var, width=48).grid(
+            row=2, column=1, sticky='ew', pady=4)
+
+        ttk.Label(inp, text="Папка сохранения:").grid(
+            row=3, column=0, sticky='e', padx=(0, 6), pady=4)
+        row3 = ttk.Frame(inp)
+        row3.grid(row=3, column=1, sticky='ew', pady=4)
+        row3.columnconfigure(0, weight=1)
+        self.in_save_path_var = tk.StringVar(value="")
+        ttk.Entry(row3, textvariable=self.in_save_path_var,
+                  state='readonly', width=38).grid(row=0, column=0, sticky='ew')
+        ttk.Button(row3, text="Выбрать папку…",
+                   command=self._choose_save_folder_in).grid(
+            row=0, column=1, padx=(6, 0))
+
+        ttk.Label(inp, text="№ папки:").grid(
+            row=4, column=0, sticky='e', padx=(0, 6), pady=4)
+        self.in_folder_num_var = tk.StringVar(value="")
+        ttk.Label(inp, textvariable=self.in_folder_num_var,
+                  anchor='w', wraplength=460, foreground='navy').grid(
+            row=4, column=1, sticky='w', pady=4)
+
+    def _build_outgoing_tab(self, frame):
+        frame.columnconfigure(1, weight=1)
+
+        # Данные из LanDocs
+        info = ttk.LabelFrame(frame, text="Данные из LanDocs", padding=8)
+        info.grid(row=0, column=0, sticky='ew', pady=(0, 8))
+        info.columnconfigure(1, weight=1)
+
+        fields = [
+            ("Дата:",             'date'),
+            ("№ письма:",         'letter_num'),
+            ("Тема письма:",      'subject'),
+            ("Исполнитель:",      'executor'),
+            ("Получатели (ФИО):", 'recipient_names'),
+            ("Получатели (орг):", 'recipient_companies'),
+            ("Связанное письмо:", 'related'),
+        ]
+        for i, (label, key) in enumerate(fields):
+            ttk.Label(info, text=label, anchor='e').grid(
+                row=i, column=0, sticky='e', padx=(0, 6), pady=2)
+            var = tk.StringVar()
+            self._out_preview_vars[key] = var
+            ttk.Label(info, textvariable=var, anchor='w', wraplength=460).grid(
+                row=i, column=1, sticky='w', pady=2)
+
+        # Данные для регистрации
+        inp = ttk.LabelFrame(frame, text="Данные для регистрации", padding=8)
+        inp.grid(row=1, column=0, sticky='ew')
+        inp.columnconfigure(1, weight=1)
+
+        ttk.Label(inp, text="Ключевые слова:").grid(
+            row=0, column=0, sticky='e', padx=(0, 6), pady=4)
+        self.out_keywords_var = tk.StringVar(value="")
+        ttk.Entry(inp, textvariable=self.out_keywords_var, width=48).grid(
+            row=0, column=1, sticky='ew', pady=4)
+
+        ttk.Label(inp, text="Контроль:").grid(
+            row=1, column=0, sticky='e', padx=(0, 6), pady=4)
+        self.out_control_var = tk.StringVar(value="")
+        ttk.Entry(inp, textvariable=self.out_control_var, width=48).grid(
+            row=1, column=1, sticky='ew', pady=4)
+
+        ttk.Label(inp, text="Название файла:").grid(
+            row=2, column=0, sticky='e', padx=(0, 6), pady=4)
+        self.out_filename_var = tk.StringVar(value="")
+        ttk.Entry(inp, textvariable=self.out_filename_var, width=48).grid(
+            row=2, column=1, sticky='ew', pady=4)
+
+        ttk.Label(inp, text="Папка сохранения:").grid(
+            row=3, column=0, sticky='e', padx=(0, 6), pady=4)
+        row3 = ttk.Frame(inp)
+        row3.grid(row=3, column=1, sticky='ew', pady=4)
+        row3.columnconfigure(0, weight=1)
+        self.out_save_path_var = tk.StringVar(value="")
+        ttk.Entry(row3, textvariable=self.out_save_path_var,
+                  state='readonly', width=38).grid(row=0, column=0, sticky='ew')
+        ttk.Button(row3, text="Выбрать папку…",
+                   command=self._choose_save_folder_out).grid(
+            row=0, column=1, padx=(6, 0))
+
+        ttk.Label(inp, text="№ папки:").grid(
+            row=4, column=0, sticky='e', padx=(0, 6), pady=4)
+        self.out_folder_num_var = tk.StringVar(value="")
+        ttk.Label(inp, textvariable=self.out_folder_num_var,
+                  anchor='w', wraplength=460, foreground='navy').grid(
+            row=4, column=1, sticky='w', pady=4)
+
+    # ── Применение данных из LanDocs ───────────────────────────────────────
+
+    def _apply_incoming_data(self):
+        d = self.in_data
+        for key, var in self._in_preview_vars.items():
             var.set(d.get(key, ''))
+        self._default_filename_in = build_default_filename_in(
+            d.get('date', ''), d.get('incoming_num', ''), d.get('letter_num', ''))
+        self.in_filename_var.set(self._default_filename_in)
+        self.in_save_path_var.set('')
+        self.in_folder_num_var.set('')
 
-        date_str  = d.get('date', '')
-        incoming  = d.get('incoming_num', '')
-        letter    = d.get('letter_num', '')
-        self._default_filename = build_default_filename(date_str, incoming, letter)
-        self.filename_var.set(self._default_filename)
-        # Сбрасываем путь сохранения при повторном парсинге
-        self.save_path_var.set('')
-        self.folder_num_var.set('')
+    def _apply_outgoing_data(self):
+        d = self.out_data
+        for key, var in self._out_preview_vars.items():
+            var.set(d.get(key, ''))
+        self._default_filename_out = build_default_filename_out(
+            d.get('date', ''), d.get('letter_num', ''))
+        self.out_filename_var.set(self._default_filename_out)
+        # Ключевые слова по умолчанию = тема письма
+        self.out_keywords_var.set(d.get('subject', ''))
+        self.out_save_path_var.set('')
+        self.out_folder_num_var.set('')
+
+    # ── Парсинг ────────────────────────────────────────────────────────────
+
+    def _active_tab(self) -> str:
+        """Возвращает 'in' или 'out' в зависимости от активной вкладки."""
+        return 'out' if self._notebook.index(self._notebook.select()) == 1 else 'in'
 
     def _start_reparse(self):
-        """Начинает обратный отсчёт перед повторным парсингом."""
         self._reparse_btn.config(state='disabled')
-        self.iconify()  # сворачиваем окно, чтобы LanDocs оказался на переднем плане
+        self.iconify()
         self._reparse_countdown(3)
 
     def _reparse_countdown(self, n: int):
@@ -489,107 +666,107 @@ class RegistrationApp(tk.Tk):
             self.after(50, self._do_reparse)
 
     def _do_reparse(self):
+        tab = self._active_tab()
         try:
-            self.landocs_data = extract_landocs_data()
-            self._apply_landocs_data()
+            if tab == 'in':
+                self.in_data = extract_landocs_data_in()
+                self._apply_incoming_data()
+            else:
+                self.out_data = extract_landocs_data_out()
+                self._apply_outgoing_data()
             self._reparse_status.set("Парсинг завершён успешно.")
         except Exception as exc:
             self._reparse_status.set(f"Ошибка парсинга: {exc}")
         finally:
             self._reparse_btn.config(state='normal')
-            self.deiconify()  # восстанавливаем окно
+            self.deiconify()
             self.lift()
 
-    # ── Логика кнопок ─────────────────────────────────────────────────────
+    # ── Выбор папки сохранения ────────────────────────────────────────────
 
-    def _choose_save_folder(self):
-        """Открывает диалог выбора папки (начиная с базовой директории)."""
+    def _choose_save_folder_in(self):
+        self._choose_save_folder(
+            file_link=self.in_data.get('file_link', ''),
+            filename_var=self.in_filename_var,
+            default_filename=self._default_filename_in,
+            save_path_var=self.in_save_path_var,
+            folder_num_var=self.in_folder_num_var,
+        )
+
+    def _choose_save_folder_out(self):
+        self._choose_save_folder(
+            file_link=self.out_data.get('file_link', ''),
+            filename_var=self.out_filename_var,
+            default_filename=self._default_filename_out,
+            save_path_var=self.out_save_path_var,
+            folder_num_var=self.out_folder_num_var,
+        )
+
+    def _choose_save_folder(self, file_link, filename_var, default_filename,
+                            save_path_var, folder_num_var):
         initial = (DEFAULT_SAVE_FOLDER
                    if os.path.isdir(DEFAULT_SAVE_FOLDER)
                    else os.path.expanduser("~"))
 
-        # Получаем расширение из ссылки на файл в LanDocs
-        file_link = self.landocs_data.get('file_link', '')
         ext = os.path.splitext(file_link)[1].lower() if file_link else '.pdf'
         if not ext:
             ext = '.pdf'
 
-        filename_base = self.filename_var.get() or self._default_filename
+        filename_base = filename_var.get() or default_filename
 
         selected = filedialog.asksaveasfilename(
             title="Выберите папку и имя файла для сохранения письма",
             initialdir=initial,
             initialfile=filename_base + ext,
             defaultextension=ext,
-            filetypes=[
-                ("PDF файлы", "*.pdf"),
-                ("Все файлы", "*.*"),
-            ],
+            filetypes=[("PDF файлы", "*.pdf"), ("Все файлы", "*.*")],
         )
         if not selected:
             return
 
-        # Нормализуем разделители
         selected = selected.replace('/', '\\')
-        self.save_path_var.set(selected)
+        save_path_var.set(selected)
 
-        # Обновляем "Название файла" из имени выбранного файла (без расширения)
         base_name = os.path.splitext(os.path.basename(selected))[0]
         if base_name:
-            self.filename_var.set(base_name)
+            filename_var.set(base_name)
 
-        # Вычисляем № папки
         folder_dir = os.path.dirname(selected)
-        folder_num = calc_folder_num(folder_dir)
-        self.folder_num_var.set(folder_num)
+        folder_num_var.set(calc_folder_num(folder_dir))
+
+    # ── Регистрация ────────────────────────────────────────────────────────
 
     def _on_register(self):
-        """Валидация и запись в журнал."""
-        if not self.save_path_var.get():
-            messagebox.showwarning(
-                "Внимание",
-                "Выберите папку и имя файла для сохранения письма.",
-                parent=self,
-            )
-            return
+        if self._active_tab() == 'in':
+            self._on_register_in()
+        else:
+            self._on_register_out()
 
+    def _on_register_in(self):
+        if not self.in_save_path_var.get():
+            messagebox.showwarning("Внимание",
+                                   "Выберите папку и имя файла для сохранения письма.",
+                                   parent=self)
+            return
         if not HAS_OPENPYXL:
-            messagebox.showerror(
-                "Ошибка",
-                "Библиотека openpyxl не установлена.\n"
-                "Установите её: pip install openpyxl",
-                parent=self,
-            )
+            messagebox.showerror("Ошибка", "Библиотека openpyxl не установлена.", parent=self)
             return
-
         try:
-            self._do_register()
-            messagebox.showinfo(
-                "Готово",
-                "Запись успешно добавлена в журнал регистрации!",
-                parent=self,
-            )
+            self._do_register_in()
+            messagebox.showinfo("Готово", "Запись успешно добавлена в журнал регистрации!",
+                                parent=self)
             self.destroy()
         except Exception as exc:
-            messagebox.showerror(
-                "Ошибка",
-                f"Не удалось записать в журнал:\n{exc}",
-                parent=self,
-            )
+            messagebox.showerror("Ошибка", f"Не удалось записать в журнал:\n{exc}", parent=self)
 
-    def _do_register(self):
-        date_str = self.landocs_data.get('date', '')
-        signatory = self.landocs_data.get('signatory', '')
-        correspondent = self.landocs_data.get('correspondent', '')
+    def _do_register_in(self):
+        d = self.in_data
+        date_str      = d.get('date', '')
+        signatory     = d.get('signatory', '')
+        correspondent = d.get('correspondent', '')
+        signed_by = f"{signatory}\n{correspondent}" if correspondent else signatory
 
-        # "За подписью" = Подписант + перенос строки внутри ячейки + Корреспондент
-        if correspondent:
-            signed_by = f"{signatory}\n{correspondent}"
-        else:
-            signed_by = signatory
-
-        # Копируем файл письма из ViewDir в выбранное место
-        hyperlink_path = self.save_path_var.get()
+        hyperlink_path = self.in_save_path_var.get()
         if hyperlink_path:
             src = find_latest_in_viewdir()
             if src:
@@ -601,20 +778,68 @@ class RegistrationApp(tk.Tk):
                     r"%LOCALAPPDATA%\Temp\ViewDir"
                 )
 
-        row_data = {
+        write_to_excel_in({
             'date':           fmt_date_ymd(date_str),
-            'incoming_num':   self.landocs_data.get('incoming_num', ''),
-            'letter_num':     self.landocs_data.get('letter_num', ''),
-            'subject':        self.landocs_data.get('subject', ''),
-            'author':         self.author_var.get(),
+            'incoming_num':   d.get('incoming_num', ''),
+            'letter_num':     d.get('letter_num', ''),
+            'subject':        d.get('subject', ''),
+            'author':         self.in_author_var.get(),
             'signed_by':      signed_by,
-            'folder_num':     self.folder_num_var.get(),
+            'folder_num':     self.in_folder_num_var.get(),
             'who_registered': getpass.getuser(),
-            'keywords':       self.keywords_var.get(),
-            'related':        self.landocs_data.get('related', ''),
+            'keywords':       self.in_keywords_var.get(),
+            'related':        d.get('related', ''),
             'hyperlink_path': hyperlink_path,
-        }
-        write_to_excel(row_data)
+        })
+
+    def _on_register_out(self):
+        if not self.out_save_path_var.get():
+            messagebox.showwarning("Внимание",
+                                   "Выберите папку и имя файла для сохранения письма.",
+                                   parent=self)
+            return
+        if not HAS_OPENPYXL:
+            messagebox.showerror("Ошибка", "Библиотека openpyxl не установлена.", parent=self)
+            return
+        try:
+            self._do_register_out()
+            messagebox.showinfo("Готово", "Запись успешно добавлена в журнал регистрации!",
+                                parent=self)
+            self.destroy()
+        except Exception as exc:
+            messagebox.showerror("Ошибка", f"Не удалось записать в журнал:\n{exc}", parent=self)
+
+    def _do_register_out(self):
+        d = self.out_data
+        date_str = d.get('date', '')
+        recipient = build_recipient_string(
+            d.get('recipient_names', ''),
+            d.get('recipient_companies', ''),
+        )
+
+        hyperlink_path = self.out_save_path_var.get()
+        if hyperlink_path:
+            src = find_latest_in_viewdir()
+            if src:
+                shutil.copy2(src, hyperlink_path)
+            else:
+                raise FileNotFoundError(
+                    "Не найден файл письма в папке ViewDir.\n"
+                    r"Убедитесь, что письмо открыто в LanDocs: "
+                    r"%LOCALAPPDATA%\Temp\ViewDir"
+                )
+
+        write_to_excel_out({
+            'date':           fmt_date_dmy(date_str),
+            'letter_num':     d.get('letter_num', ''),
+            'subject':        d.get('subject', ''),
+            'recipient':      recipient,
+            'executor':       d.get('executor', ''),
+            'keywords':       self.out_keywords_var.get(),
+            'related':        d.get('related', ''),
+            'control':        self.out_control_var.get(),
+            'hyperlink_path': hyperlink_path,
+        })
 
     # ── Утилиты ───────────────────────────────────────────────────────────
 
@@ -628,7 +853,6 @@ class RegistrationApp(tk.Tk):
 # ── Точка входа ───────────────────────────────────────────────────────────────
 
 def main():
-    # Проверяем зависимости
     missing = []
     if not HAS_WIN32:
         missing.append("pywin32")
@@ -646,13 +870,7 @@ def main():
         root.destroy()
         sys.exit(1)
 
-    # Открываем окно сразу с пустыми полями.
-    # Парсинг запускается вручную кнопкой "Запустить парсинг".
-    empty_data = {
-        'incoming_num': '', 'file_link': '', 'correspondent': '',
-        'date': '', 'letter_num': '', 'signatory': '', 'subject': '', 'related': '',
-    }
-    app = RegistrationApp(empty_data)
+    app = RegistrationApp()
     app.mainloop()
 
 
