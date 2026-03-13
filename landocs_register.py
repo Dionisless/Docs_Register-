@@ -202,6 +202,32 @@ def extract_landocs_data() -> dict:
     return data
 
 
+# ── Поиск файла письма в ViewDir ─────────────────────────────────────────────
+
+def find_latest_in_viewdir() -> str:
+    """
+    Возвращает полный путь к самому новому файлу в папке
+    %LOCALAPPDATA%\\Temp\\ViewDir (и её подпапках).
+    Именно туда LanDocs временно кладёт открытый файл письма.
+    """
+    local_app = os.environ.get('LOCALAPPDATA') or os.path.join(
+        os.environ.get('USERPROFILE', ''), 'AppData', 'Local')
+    view_dir = os.path.join(local_app, 'Temp', 'ViewDir')
+    if not os.path.isdir(view_dir):
+        return ''
+    latest_path, latest_mtime = '', 0.0
+    for dirpath, _, filenames in os.walk(view_dir):
+        for fname in filenames:
+            fpath = os.path.join(dirpath, fname)
+            try:
+                mtime = os.path.getmtime(fpath)
+                if mtime > latest_mtime:
+                    latest_mtime, latest_path = mtime, fpath
+            except OSError:
+                pass
+    return latest_path
+
+
 # ── Вспомогательные функции ───────────────────────────────────────────────────
 
 def sanitize_for_filename(text: str) -> str:
@@ -326,15 +352,12 @@ class RegistrationApp(tk.Tk):
     def __init__(self, landocs_data: dict):
         super().__init__()
         self.landocs_data = landocs_data
-
-        date_str = landocs_data.get('date', '')
-        incoming = landocs_data.get('incoming_num', '')
-        letter = landocs_data.get('letter_num', '')
-        self._default_filename = build_default_filename(date_str, incoming, letter)
+        self._preview_vars = {}  # StringVar-ы для полей из LanDocs
 
         self.title("Регистрация входящей корреспонденции")
         self.resizable(True, False)
         self._build_ui()
+        self._apply_landocs_data()
         self._center_window()
 
     # ── Построение интерфейса ──────────────────────────────────────────────
@@ -362,7 +385,9 @@ class RegistrationApp(tk.Tk):
         for i, (label, key) in enumerate(preview_fields):
             ttk.Label(info_frame, text=label, anchor='e').grid(
                 row=i, column=0, sticky='e', padx=(0, 6), pady=2)
-            ttk.Label(info_frame, text=self.landocs_data.get(key, ''),
+            var = tk.StringVar()
+            self._preview_vars[key] = var
+            ttk.Label(info_frame, textvariable=var,
                       anchor='w', wraplength=460).grid(
                 row=i, column=1, sticky='w', pady=2)
 
@@ -414,14 +439,65 @@ class RegistrationApp(tk.Tk):
                   anchor='w', wraplength=460, foreground='navy').grid(
             row=4, column=1, sticky='w', pady=4)
 
+        # --- Статус парсинга ---
+        self._reparse_status = tk.StringVar(value="")
+        ttk.Label(root_frame, textvariable=self._reparse_status,
+                  foreground='gray').grid(row=2, column=0, pady=(0, 2))
+
         # --- Кнопки ---
         btn_frame = ttk.Frame(root_frame)
-        btn_frame.grid(row=2, column=0, pady=4)
+        btn_frame.grid(row=3, column=0, pady=4)
 
         ttk.Button(btn_frame, text="Зарегистрировать в журнал",
                    command=self._on_register).pack(side='left', padx=6)
+        self._reparse_btn = ttk.Button(btn_frame, text="Запустить парсинг заново",
+                                       command=self._start_reparse)
+        self._reparse_btn.pack(side='left', padx=6)
         ttk.Button(btn_frame, text="Отмена",
                    command=self.destroy).pack(side='left', padx=6)
+
+    # ── Обновление данных из LanDocs ──────────────────────────────────────
+
+    def _apply_landocs_data(self):
+        """Заполняет preview-метки и обновляет имя файла по умолчанию."""
+        d = self.landocs_data
+        for key, var in self._preview_vars.items():
+            var.set(d.get(key, ''))
+
+        date_str  = d.get('date', '')
+        incoming  = d.get('incoming_num', '')
+        letter    = d.get('letter_num', '')
+        self._default_filename = build_default_filename(date_str, incoming, letter)
+        self.filename_var.set(self._default_filename)
+        # Сбрасываем путь сохранения при повторном парсинге
+        self.save_path_var.set('')
+        self.folder_num_var.set('')
+
+    def _start_reparse(self):
+        """Начинает обратный отсчёт перед повторным парсингом."""
+        self._reparse_btn.config(state='disabled')
+        self.iconify()  # сворачиваем окно, чтобы LanDocs оказался на переднем плане
+        self._reparse_countdown(3)
+
+    def _reparse_countdown(self, n: int):
+        if n > 0:
+            self._reparse_status.set(f"Переключитесь в LanDocs… парсинг через {n} сек.")
+            self.after(1000, self._reparse_countdown, n - 1)
+        else:
+            self._reparse_status.set("Выполняется парсинг…")
+            self.after(50, self._do_reparse)
+
+    def _do_reparse(self):
+        try:
+            self.landocs_data = extract_landocs_data()
+            self._apply_landocs_data()
+            self._reparse_status.set("Парсинг завершён успешно.")
+        except Exception as exc:
+            self._reparse_status.set(f"Ошибка парсинга: {exc}")
+        finally:
+            self._reparse_btn.config(state='normal')
+            self.deiconify()  # восстанавливаем окно
+            self.lift()
 
     # ── Логика кнопок ─────────────────────────────────────────────────────
 
@@ -511,16 +587,17 @@ class RegistrationApp(tk.Tk):
         else:
             signed_by = signatory
 
-        # Копируем файл письма из LanDocs в выбранную папку
+        # Копируем файл письма из ViewDir в выбранное место
         hyperlink_path = self.save_path_var.get()
-        file_link = self.landocs_data.get('file_link', '')
-        if file_link and hyperlink_path:
-            if os.path.exists(file_link):
-                shutil.copy2(file_link, hyperlink_path)
+        if hyperlink_path:
+            src = find_latest_in_viewdir()
+            if src:
+                shutil.copy2(src, hyperlink_path)
             else:
                 raise FileNotFoundError(
-                    f"Файл письма не найден:\n{file_link}\n\n"
-                    "Проверьте, что путь из LanDocs доступен с этого компьютера."
+                    "Не найден файл письма в папке ViewDir.\n"
+                    r"Убедитесь, что письмо открыто в LanDocs: "
+                    r"%LOCALAPPDATA%\Temp\ViewDir"
                 )
 
         row_data = {
