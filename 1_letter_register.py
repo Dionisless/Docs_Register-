@@ -13,12 +13,13 @@
 
 Исходящие поля LanDocs (Tab от начала):
   0  — № письма   1  — Дата     5  — Тема
-  6  — Исполнитель 9 — ФИО получателей  10 — Компании  16 — Связанное
+  6  — Исполнитель 9 — Компании  10 — ФИО получателей  16 — Связанное
 """
 
 import os
 import re
 import sys
+import json
 import time
 import shutil
 import getpass
@@ -60,6 +61,37 @@ LETTER_FILETYPES = [
     ("Excel файлы",               "*.xls *.xlsx"),
     ("Все файлы",                 "*.*"),
 ]
+
+# ── Настройки ─────────────────────────────────────────────────────────────────
+
+def _app_dir() -> str:
+    if getattr(sys, 'frozen', False):
+        return os.path.dirname(sys.executable)
+    return os.path.dirname(os.path.abspath(__file__))
+
+SETTINGS_FILE = os.path.join(_app_dir(), 'letter_settings.json')
+
+_settings: dict = {
+    'org_abbreviations': {},
+    'registrar_name': '',
+}
+
+def load_settings():
+    global _settings
+    try:
+        if os.path.exists(SETTINGS_FILE):
+            with open(SETTINGS_FILE, 'r', encoding='utf-8') as f:
+                data = json.load(f)
+                _settings.update(data)
+    except Exception:
+        pass
+
+def save_settings():
+    try:
+        with open(SETTINGS_FILE, 'w', encoding='utf-8') as f:
+            json.dump(_settings, f, ensure_ascii=False, indent=2)
+    except Exception as e:
+        messagebox.showerror("Ошибка", f"Не удалось сохранить настройки:\n{e}")
 
 # ── Клавиатура / буфер обмена ────────────────────────────────────────────────
 
@@ -146,8 +178,9 @@ def extract_landocs_data_out() -> dict:
     navigate_tabs(1 - current); current = 1; data['date'] = read_current_field()
     navigate_tabs(5 - current); current = 5; data['subject'] = read_current_field()
     navigate_tabs(6 - current); current = 6; data['executor'] = read_current_field()
-    navigate_tabs(9 - current); current = 9; data['recipient_names'] = read_current_field()
-    navigate_tabs(10 - current); current = 10; data['recipient_companies'] = read_current_field()
+    # Позиция 9 — компании, позиция 10 — ФИО (в LanDocs именно такой порядок)
+    navigate_tabs(9 - current); current = 9; data['recipient_companies'] = read_current_field()
+    navigate_tabs(10 - current); current = 10; data['recipient_names'] = read_current_field()
     navigate_tabs(16 - current); data['related'] = read_current_field()
     return data
 
@@ -188,15 +221,35 @@ def fmt_date_dmy_underscore(date_str: str) -> str:
     dt = parse_date(date_str)
     return dt.strftime('%d_%m_%Y') if dt else re.sub(r'[.\-/]', '_', date_str)
 
-def build_default_filename_in(date_str: str, incoming_num: str, letter_num: str) -> str:
-    return f"{fmt_date_ymd(date_str)} {incoming_num}_{sanitize_for_filename(letter_num)}_{fmt_date_dmy_underscore(date_str)}"
+def abbreviate_fio(fio: str) -> str:
+    """Фамилия Имя Отчество -> Фамилия И.О. (если >= 3 слова)"""
+    parts = fio.strip().split()
+    if len(parts) >= 3:
+        return f"{parts[0]} {parts[1][0]}.{parts[2][0]}."
+    elif len(parts) == 2:
+        return f"{parts[0]} {parts[1][0]}."
+    return fio
+
+def abbreviate_org(org: str) -> str:
+    """Возвращает сокращённое название если есть в словаре, иначе исходное."""
+    org_stripped = org.strip()
+    abbrs = _settings.get('org_abbreviations', {})
+    return abbrs.get(org_stripped, org_stripped)
+
+def build_default_filename_in(date_str: str, incoming_num: str, letter_num: str,
+                               subject: str = '') -> str:
+    inner = f"{incoming_num}_{sanitize_for_filename(letter_num)}_{fmt_date_dmy_underscore(date_str)}"
+    subject_clean = sanitize_for_filename(subject.strip()) if subject.strip() else ''
+    if subject_clean:
+        return f"{fmt_date_ymd(date_str)} от {subject_clean} ({inner})"
+    return f"{fmt_date_ymd(date_str)} ({inner})"
 
 def build_default_filename_out(date_str: str, letter_num: str) -> str:
     return f"{fmt_date_ymd(date_str)} {sanitize_for_filename(letter_num)}_{fmt_date_dmy_underscore(date_str)}"
 
 def build_recipient_string(names_str: str, companies_str: str) -> str:
-    names     = [n.strip() for n in names_str.split(';') if n.strip()]
-    companies = [c.strip() for c in companies_str.split(';') if c.strip()]
+    names     = [abbreviate_fio(n.strip()) for n in names_str.split(';') if n.strip()]
+    companies = [abbreviate_org(c.strip()) for c in companies_str.split(';') if c.strip()]
     parts = [f"{i}. {n} {c}" for i, (n, c) in enumerate(zip(names, companies), 1)]
     return ';\n'.join(parts) if parts else names_str
 
@@ -287,6 +340,87 @@ def write_to_excel_out(row_data: dict):
     ws.cell(r,8).value = row_data['control']
     wb.save(EXCEL_PATH_OUT)
 
+# ── Окно настроек ─────────────────────────────────────────────────────────────
+
+class SettingsWindow(tk.Toplevel):
+
+    def __init__(self, parent):
+        super().__init__(parent)
+        self.title("Настройки")
+        self.resizable(True, True)
+        self.transient(parent)
+        self.grab_set()
+        self._build()
+        self.update_idletasks()
+        w, h = self.winfo_width(), self.winfo_height()
+        sw, sh = self.winfo_screenwidth(), self.winfo_screenheight()
+        self.geometry(f"+{(sw-w)//2}+{(sh-h)//2}")
+
+    def _build(self):
+        f = ttk.Frame(self, padding=12)
+        f.grid(row=0, column=0, sticky='nsew')
+        self.columnconfigure(0, weight=1)
+        self.rowconfigure(0, weight=1)
+        f.columnconfigure(1, weight=1)
+        f.rowconfigure(4, weight=1)
+
+        # Имя регистратора
+        ttk.Label(f, text="Имя регистратора (столбец H входящих):").grid(
+            row=0, column=0, sticky='e', padx=(0, 6), pady=(0, 4))
+        self._reg_var = tk.StringVar(value=_settings.get('registrar_name', ''))
+        ttk.Entry(f, textvariable=self._reg_var, width=32).grid(
+            row=0, column=1, sticky='ew', pady=(0, 4))
+        ttk.Label(f, text="(Оставьте пустым — будет использоваться системное имя пользователя)",
+                  foreground='gray').grid(row=1, column=0, columnspan=2, sticky='w', pady=(0, 12))
+
+        # Сокращения организаций
+        ttk.Label(f, text="Сокращения организаций:").grid(
+            row=2, column=0, columnspan=2, sticky='w', pady=(0, 2))
+        ttk.Label(f, text="Формат:  Полное название организации = Сокращение",
+                  foreground='gray').grid(row=3, column=0, columnspan=2, sticky='w', pady=(0, 4))
+
+        txt_frame = ttk.Frame(f)
+        txt_frame.grid(row=4, column=0, columnspan=2, sticky='nsew', pady=(0, 8))
+        txt_frame.columnconfigure(0, weight=1)
+        txt_frame.rowconfigure(0, weight=1)
+
+        self._abbr_text = tk.Text(txt_frame, width=72, height=18, wrap='none',
+                                   font=('Consolas', 9))
+        sb_v = ttk.Scrollbar(txt_frame, orient='vertical', command=self._abbr_text.yview)
+        sb_h = ttk.Scrollbar(txt_frame, orient='horizontal', command=self._abbr_text.xview)
+        self._abbr_text.configure(yscrollcommand=sb_v.set, xscrollcommand=sb_h.set)
+        self._abbr_text.grid(row=0, column=0, sticky='nsew')
+        sb_v.grid(row=0, column=1, sticky='ns')
+        sb_h.grid(row=1, column=0, sticky='ew')
+
+        # Заполняем из словаря
+        abbrs = _settings.get('org_abbreviations', {})
+        for key, val in abbrs.items():
+            self._abbr_text.insert('end', f"{key} = {val}\n")
+
+        # Кнопки
+        btn_frame = ttk.Frame(f)
+        btn_frame.grid(row=5, column=0, columnspan=2, pady=(4, 0))
+        ttk.Button(btn_frame, text="Сохранить", command=self._save).pack(side='left', padx=6)
+        ttk.Button(btn_frame, text="Отмена", command=self.destroy).pack(side='left', padx=6)
+
+    def _save(self):
+        lines = self._abbr_text.get('1.0', 'end').strip().splitlines()
+        abbrs = {}
+        for line in lines:
+            line = line.strip()
+            if not line or line.startswith('#'):
+                continue
+            if '=' in line:
+                key, _, val = line.partition('=')
+                key, val = key.strip(), val.strip()
+                if key and val:
+                    abbrs[key] = val
+        _settings['org_abbreviations'] = abbrs
+        _settings['registrar_name'] = self._reg_var.get().strip()
+        save_settings()
+        self.destroy()
+
 # ── Главное окно ──────────────────────────────────────────────────────────────
 
 class RegistrationApp(tk.Tk):
@@ -335,6 +469,8 @@ class RegistrationApp(tk.Tk):
         self._reparse_btn = ttk.Button(btn_frame, text="Считать из LanDocs заново",
                                        command=self._start_reparse)
         self._reparse_btn.pack(side='left', padx=6)
+        ttk.Button(btn_frame, text="Настройки",
+                   command=self._open_settings).pack(side='left', padx=6)
         ttk.Button(btn_frame, text="Закрыть",
                    command=self.destroy).pack(side='left', padx=6)
 
@@ -439,8 +575,10 @@ class RegistrationApp(tk.Tk):
         for key, var in self._in_preview_vars.items():
             var.set(d.get(key, ''))
         self._default_filename_in = build_default_filename_in(
-            d.get('date',''), d.get('incoming_num',''), d.get('letter_num',''))
+            d.get('date',''), d.get('incoming_num',''), d.get('letter_num',''),
+            d.get('subject',''))
         self.in_filename_var.set(self._default_filename_in)
+        self.in_keywords_var.set(d.get('subject', ''))
         self.in_save_path_var.set('')
         self.in_folder_num_var.set('')
 
@@ -577,8 +715,8 @@ class RegistrationApp(tk.Tk):
             messagebox.showerror("Ошибка", "openpyxl не установлен.\npip install openpyxl", parent=self); return
         try:
             d = self.in_data
-            signatory     = d.get('signatory', '')
-            correspondent = d.get('correspondent', '')
+            signatory     = abbreviate_fio(d.get('signatory', ''))
+            correspondent = abbreviate_org(d.get('correspondent', ''))
             signed_by = f"{signatory}\n{correspondent}" if correspondent else signatory
             hyperlink_path = self.in_save_path_var.get()
             if hyperlink_path:
@@ -589,6 +727,7 @@ class RegistrationApp(tk.Tk):
                     raise FileNotFoundError(
                         "Файл письма не найден в ViewDir.\n"
                         r"Убедитесь, что письмо открыто в LanDocs (%LOCALAPPDATA%\Temp\ViewDir)")
+            registrar = _settings.get('registrar_name', '').strip() or getpass.getuser()
             write_to_excel_in({
                 'date':           fmt_date_ymd(d.get('date','')),
                 'incoming_num':   d.get('incoming_num',''),
@@ -597,7 +736,7 @@ class RegistrationApp(tk.Tk):
                 'author':         self.in_author_var.get(),
                 'signed_by':      signed_by,
                 'folder_num':     self.in_folder_num_var.get(),
-                'who_registered': getpass.getuser(),
+                'who_registered': registrar,
                 'keywords':       self.in_keywords_var.get(),
                 'related':        d.get('related',''),
                 'hyperlink_path': hyperlink_path,
@@ -624,12 +763,12 @@ class RegistrationApp(tk.Tk):
                 else:
                     raise FileNotFoundError("Файл письма не найден в ViewDir.")
             write_to_excel_out({
-                'date':           fmt_date_dmy(d.get('date','')),
+                'date':           fmt_date_ymd(d.get('date','')),
                 'letter_num':     d.get('letter_num',''),
                 'subject':        d.get('subject',''),
                 'recipient':      build_recipient_string(
                                       d.get('recipient_names',''), d.get('recipient_companies','')),
-                'executor':       d.get('executor',''),
+                'executor':       abbreviate_fio(d.get('executor','')),
                 'keywords':       self.out_keywords_var.get(),
                 'related':        d.get('related',''),
                 'control':        self.out_control_var.get(),
@@ -640,6 +779,11 @@ class RegistrationApp(tk.Tk):
             self.out_folder_num_var.set('')
         except Exception as exc:
             messagebox.showerror("Ошибка", str(exc), parent=self)
+
+    # ── Настройки ─────────────────────────────────────────────────────────
+
+    def _open_settings(self):
+        SettingsWindow(self)
 
     # ── Центровка ─────────────────────────────────────────────────────────
 
@@ -653,6 +797,7 @@ class RegistrationApp(tk.Tk):
 # ── Точка входа ───────────────────────────────────────────────────────────────
 
 def main():
+    load_settings()
     missing = []
     if not HAS_WIN32:    missing.append("pywin32")
     if not HAS_OPENPYXL: missing.append("openpyxl")
