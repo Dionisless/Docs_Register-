@@ -1,0 +1,17 @@
+# Общие зависимости для всех 4 программ
+openpyxl>=3.1
+python-docx>=1.1
+pywin32>=306
+
+# Для drag-and-drop (опционально)
+tkinterdnd2>=0.3
+
+# Для программы 3 (Visio экспорт синих строк)
+lxml>=5.0
+
+# Для программы 4 (ДЭБ)
+selenium>=4.20
+pyautogui>=0.9
+
+# Для сборки .exe
+pyinstaller>=6.0
