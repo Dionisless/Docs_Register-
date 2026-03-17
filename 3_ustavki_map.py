@@ -246,6 +246,11 @@ class UstavkiMapApp(_BASE_CLASS):
         ttk.Button(bot, text="Загрузить сессию",   command=self._load_session).pack(side='left', padx=4)
         ttk.Button(bot, text="Сохранить сессию",   command=self._save_session).pack(side='left', padx=4)
         ttk.Button(bot, text="Редактировать список", command=self._edit_entries).pack(side='left', padx=4)
+        ttk.Separator(bot, orient='vertical').pack(side='left', fill='y', padx=6)
+        ttk.Button(bot, text="▶ Шаг 5: Отчёт изменений",
+                   command=self._create_changes_report).pack(side='left', padx=4)
+        ttk.Button(bot, text="▶ Шаг 6: Обновить карты Visio",
+                   command=self._update_maps_all).pack(side='left', padx=4)
         ttk.Button(bot, text="Закрыть",            command=self.destroy).pack(side='right', padx=4)
 
     def _build_step5(self, parent):

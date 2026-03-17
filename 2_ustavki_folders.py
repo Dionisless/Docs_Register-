@@ -645,8 +645,7 @@ class UstavkiFoldersApp(_BASE_CLASS):
         parent.rowconfigure(1, weight=1)
         ttk.Label(parent,
             text="Ищет кандидата на архив в папке \\\\Prim-fs-serv\\...\\Таблицы уставок РЗА\\Объект\\\n"
-                 "А — по схожести имени файла   |   Б — по схожести диспетчерского наименования\n"
-                 "Двойной клик — выбрать другого кандидата из списка.",
+                 "по схожести имени файла. Двойной клик — выбрать другого кандидата из списка.",
             wraplength=700, foreground='gray').grid(row=0, column=0, sticky='w', pady=(0, 4))
         af = ttk.Frame(parent)
         af.grid(row=1, column=0, sticky='nsew')
@@ -668,10 +667,8 @@ class UstavkiFoldersApp(_BASE_CLASS):
         self._arc_tree.bind('<Double-1>', self._on_arc_dclick)
         bf = ttk.Frame(parent)
         bf.grid(row=2, column=0, pady=(6, 0), sticky='w')
-        ttk.Button(bf, text="А: Найти кандидатов по имени файла",
+        ttk.Button(bf, text="Найти кандидатов на архив",
                    command=self._find_candidates_a).pack(side='left', padx=4)
-        ttk.Button(bf, text="Б: Найти кандидатов по дисп. наим.",
-                   command=self._find_candidates_b).pack(side='left', padx=4)
         ttk.Button(bf, text="Разложить файлы",
                    command=self._move_files).pack(side='left', padx=4)
 
