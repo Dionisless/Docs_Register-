@@ -5,9 +5,10 @@
 ============================================================
 Регистрирует письма в журналы Excel.
 
-ИСПРАВЛЕНИЯ по сравнению со старой версией:
+ИСПРАВЛЕНИЯ:
+  - Возврат к проверенной структуре старой версии
   - Импорт писем в форматах PDF, Word (.doc/.docx) и Excel (.xls/.xlsx)
-  - Все поля из LanDocs стали редактируемыми (Entry вместо Label)
+  - Все поля из LanDocs редактируемые (Entry вместо Label)
 
 ИНТЕРФЕЙС ДЛЯ СШИВАНИЯ:
   - get_letter_data() → dict  — вернуть данные текущего письма
@@ -22,6 +23,7 @@ import sys
 import time
 import shutil
 import getpass
+import threading
 import tkinter as tk
 from tkinter import ttk, filedialog, messagebox
 from datetime import datetime
@@ -47,14 +49,6 @@ try:
     HAS_OPENPYXL = True
 except ImportError:
     HAS_OPENPYXL = False
-
-try:
-    from tkinterdnd2 import DND_FILES, TkinterDnD
-    HAS_DND = True
-    _BASE_CLASS = TkinterDnD.Tk
-except Exception:
-    HAS_DND = False
-    _BASE_CLASS = tk.Tk
 
 TAB_DELAY  = 0.07
 COPY_DELAY = 0.12
@@ -335,7 +329,7 @@ def write_to_excel_out(row_data: dict):
 
 # ── Главное окно ─────────────────────────────────────────────────────────────
 
-class LetterRegisterApp(_BASE_CLASS):
+class LetterRegisterApp(tk.Tk):
     """
     Программа 1: Регистрация входящих/исходящих писем.
 
@@ -353,14 +347,18 @@ class LetterRegisterApp(_BASE_CLASS):
         self._default_filename_out = ''
         self._in_field_vars  = {}   # key → StringVar (Entry — редактируемые)
         self._out_field_vars = {}
+        self._parse_thread   = None
 
         # Загрузить прошлую сессию
-        session = load_session()
-        if 'letter' in session:
-            self.in_data = session['letter'].get('in_data', {})
-            self.out_data = session['letter'].get('out_data', {})
+        try:
+            session = load_session()
+            if 'letter' in session:
+                self.in_data  = session['letter'].get('in_data', {})
+                self.out_data = session['letter'].get('out_data', {})
+        except Exception:
+            pass
 
-        self.title("Регистрация корреспонденции v2")
+        self.title("Регистрация корреспонденции v2.1")
         self.resizable(True, True)
         self._build_ui()
         self._apply_incoming_data()
@@ -397,21 +395,26 @@ class LetterRegisterApp(_BASE_CLASS):
         # Кнопки действий
         btn_frame = ttk.Frame(root_frame)
         btn_frame.grid(row=1, column=0, pady=6)
-        ttk.Button(btn_frame, text="Зарегистрировать в журнал",
-                   command=self._on_register).pack(side='left', padx=6)
+
         self._reparse_btn = ttk.Button(btn_frame, text="Считать из LanDocs (F5)",
                                        command=self._start_reparse)
         self._reparse_btn.pack(side='left', padx=6)
+
+        ttk.Button(btn_frame, text="Зарегистрировать в журнал",
+                   command=self._on_register).pack(side='left', padx=6)
         ttk.Button(btn_frame, text="Сохранить сессию",
                    command=self._save_current_session).pack(side='left', padx=6)
         ttk.Button(btn_frame, text="Закрыть",
                    command=self.destroy).pack(side='left', padx=6)
 
-        self._status_var = tk.StringVar(value="")
+        self._status_var = tk.StringVar(value="Готово.")
         ttk.Label(root_frame, textvariable=self._status_var,
                   foreground='gray').grid(row=2, column=0, pady=(0, 4))
 
+        # Таймер: обновляет статус из фонового потока
+        self._timer_running = True
         self.bind('<F5>', lambda _: self._start_reparse())
+        self.bind('<Destroy>', lambda _: self._on_destroy())
 
     def _build_field_row(self, parent, row, label_text, key, store, width=52):
         """Строит строку: Label + Entry (редактируемое) для поля из LanDocs."""
@@ -429,17 +432,17 @@ class LetterRegisterApp(_BASE_CLASS):
         imp = ttk.LabelFrame(frame, text="Импорт из журнала входящих", padding=8)
         imp.grid(row=0, column=0, columnspan=2, sticky='ew', pady=(0, 6))
         imp.columnconfigure(3, weight=1)
-        ttk.Label(imp, text="№ вх:").grid(row=0, column=0, sticky='e', padx=(0,4))
+        ttk.Label(imp, text="№ вх:").grid(row=0, column=0, sticky='e', padx=(0, 4))
         self._in_import_num = tk.StringVar()
         ttk.Entry(imp, textvariable=self._in_import_num, width=18).grid(row=0, column=1)
-        ttk.Label(imp, text="  Год:").grid(row=0, column=2, sticky='e', padx=(8,4))
+        ttk.Label(imp, text="  Год:").grid(row=0, column=2, sticky='e', padx=(8, 4))
         self._in_import_year = tk.StringVar(value=str(datetime.now().year))
         ttk.Entry(imp, textvariable=self._in_import_year, width=6).grid(row=0, column=3, sticky='w')
         ttk.Button(imp, text="Найти в журнале",
-                   command=self._on_import_journal).grid(row=0, column=4, padx=(8,0))
+                   command=self._on_import_journal).grid(row=0, column=4, padx=(8, 0))
         self._import_status = tk.StringVar(value="")
         ttk.Label(imp, textvariable=self._import_status,
-                  foreground='navy').grid(row=1, column=0, columnspan=5, pady=(4,0), sticky='w')
+                  foreground='navy').grid(row=1, column=0, columnspan=5, pady=(4, 0), sticky='w')
 
         # Данные из LanDocs — ВСЕ ПОЛЯ РЕДАКТИРУЕМЫЕ
         info = ttk.LabelFrame(frame, text="Данные письма (все поля редактируемые)", padding=8)
@@ -462,23 +465,23 @@ class LetterRegisterApp(_BASE_CLASS):
         inp = ttk.LabelFrame(frame, text="Данные для регистрации", padding=8)
         inp.grid(row=2, column=0, columnspan=2, sticky='ew')
         inp.columnconfigure(1, weight=1)
-        ttk.Label(inp, text="Автор письма:").grid(row=0, column=0, sticky='e', padx=(0,6), pady=4)
+        ttk.Label(inp, text="Автор письма:").grid(row=0, column=0, sticky='e', padx=(0, 6), pady=4)
         self.in_author_var = tk.StringVar(value="-")
         ttk.Entry(inp, textvariable=self.in_author_var, width=48).grid(row=0, column=1, sticky='ew', pady=4)
-        ttk.Label(inp, text="Ключевые слова:").grid(row=1, column=0, sticky='e', padx=(0,6), pady=4)
+        ttk.Label(inp, text="Ключевые слова:").grid(row=1, column=0, sticky='e', padx=(0, 6), pady=4)
         self.in_keywords_var = tk.StringVar()
         ttk.Entry(inp, textvariable=self.in_keywords_var, width=48).grid(row=1, column=1, sticky='ew', pady=4)
-        ttk.Label(inp, text="Название файла:").grid(row=2, column=0, sticky='e', padx=(0,6), pady=4)
+        ttk.Label(inp, text="Название файла:").grid(row=2, column=0, sticky='e', padx=(0, 6), pady=4)
         self.in_filename_var = tk.StringVar()
         ttk.Entry(inp, textvariable=self.in_filename_var, width=48).grid(row=2, column=1, sticky='ew', pady=4)
-        ttk.Label(inp, text="Папка сохранения:").grid(row=3, column=0, sticky='e', padx=(0,6), pady=4)
+        ttk.Label(inp, text="Папка сохранения:").grid(row=3, column=0, sticky='e', padx=(0, 6), pady=4)
         row3 = ttk.Frame(inp); row3.grid(row=3, column=1, sticky='ew', pady=4)
         row3.columnconfigure(0, weight=1)
         self.in_save_path_var = tk.StringVar()
         ttk.Entry(row3, textvariable=self.in_save_path_var, width=40).grid(row=0, column=0, sticky='ew')
         ttk.Button(row3, text="Выбрать…",
-                   command=self._choose_save_folder_in).grid(row=0, column=1, padx=(6,0))
-        ttk.Label(inp, text="№ папки:").grid(row=4, column=0, sticky='e', padx=(0,6), pady=4)
+                   command=self._choose_save_folder_in).grid(row=0, column=1, padx=(6, 0))
+        ttk.Label(inp, text="№ папки:").grid(row=4, column=0, sticky='e', padx=(0, 6), pady=4)
         self.in_folder_num_var = tk.StringVar()
         ttk.Label(inp, textvariable=self.in_folder_num_var,
                   anchor='w', foreground='navy').grid(row=4, column=1, sticky='w', pady=4)
@@ -504,23 +507,23 @@ class LetterRegisterApp(_BASE_CLASS):
         inp = ttk.LabelFrame(frame, text="Данные для регистрации", padding=8)
         inp.grid(row=1, column=0, columnspan=2, sticky='ew')
         inp.columnconfigure(1, weight=1)
-        ttk.Label(inp, text="Ключевые слова:").grid(row=0, column=0, sticky='e', padx=(0,6), pady=4)
+        ttk.Label(inp, text="Ключевые слова:").grid(row=0, column=0, sticky='e', padx=(0, 6), pady=4)
         self.out_keywords_var = tk.StringVar()
         ttk.Entry(inp, textvariable=self.out_keywords_var, width=48).grid(row=0, column=1, sticky='ew', pady=4)
-        ttk.Label(inp, text="Контроль:").grid(row=1, column=0, sticky='e', padx=(0,6), pady=4)
+        ttk.Label(inp, text="Контроль:").grid(row=1, column=0, sticky='e', padx=(0, 6), pady=4)
         self.out_control_var = tk.StringVar()
         ttk.Entry(inp, textvariable=self.out_control_var, width=48).grid(row=1, column=1, sticky='ew', pady=4)
-        ttk.Label(inp, text="Название файла:").grid(row=2, column=0, sticky='e', padx=(0,6), pady=4)
+        ttk.Label(inp, text="Название файла:").grid(row=2, column=0, sticky='e', padx=(0, 6), pady=4)
         self.out_filename_var = tk.StringVar()
         ttk.Entry(inp, textvariable=self.out_filename_var, width=48).grid(row=2, column=1, sticky='ew', pady=4)
-        ttk.Label(inp, text="Папка сохранения:").grid(row=3, column=0, sticky='e', padx=(0,6), pady=4)
+        ttk.Label(inp, text="Папка сохранения:").grid(row=3, column=0, sticky='e', padx=(0, 6), pady=4)
         row3 = ttk.Frame(inp); row3.grid(row=3, column=1, sticky='ew', pady=4)
         row3.columnconfigure(0, weight=1)
         self.out_save_path_var = tk.StringVar()
         ttk.Entry(row3, textvariable=self.out_save_path_var, width=40).grid(row=0, column=0, sticky='ew')
         ttk.Button(row3, text="Выбрать…",
-                   command=self._choose_save_folder_out).grid(row=0, column=1, padx=(6,0))
-        ttk.Label(inp, text="№ папки:").grid(row=4, column=0, sticky='e', padx=(0,6), pady=4)
+                   command=self._choose_save_folder_out).grid(row=0, column=1, padx=(6, 0))
+        ttk.Label(inp, text="№ папки:").grid(row=4, column=0, sticky='e', padx=(0, 6), pady=4)
         self.out_folder_num_var = tk.StringVar()
         ttk.Label(inp, textvariable=self.out_folder_num_var,
                   anchor='w', foreground='navy').grid(row=4, column=1, sticky='w', pady=4)
@@ -532,7 +535,7 @@ class LetterRegisterApp(_BASE_CLASS):
         for key, var in self._in_field_vars.items():
             var.set(d.get(key, ''))
         self._default_filename_in = build_default_filename_in(
-            d.get('date',''), d.get('incoming_num',''), d.get('letter_num',''))
+            d.get('date', ''), d.get('incoming_num', ''), d.get('letter_num', ''))
         self.in_filename_var.set(self._default_filename_in)
 
     def _apply_outgoing_data(self):
@@ -540,7 +543,7 @@ class LetterRegisterApp(_BASE_CLASS):
         for key, var in self._out_field_vars.items():
             var.set(d.get(key, ''))
         self._default_filename_out = build_default_filename_out(
-            d.get('date',''), d.get('letter_num',''))
+            d.get('date', ''), d.get('letter_num', ''))
         self.out_filename_var.set(self._default_filename_out)
         self.out_keywords_var.set(d.get('subject', ''))
 
@@ -581,34 +584,51 @@ class LetterRegisterApp(_BASE_CLASS):
         return 'out' if self._nb.index(self._nb.select()) == 1 else 'in'
 
     def _start_reparse(self):
+        """
+        Запускает считывание из LanDocs.
+        Используем threading вместо iconify/after чтобы не терять отклик кнопки.
+        Окно уходит на задний план через lower() чтобы пользователь мог
+        переключиться в LanDocs; считывание через 3 секунды в отдельном потоке.
+        """
+        if self._parse_thread and self._parse_thread.is_alive():
+            return  # Уже идёт считывание
         self._reparse_btn.config(state='disabled')
-        self.iconify()
-        self._reparse_countdown(3)
-
-    def _reparse_countdown(self, n: int):
-        if n > 0:
-            self._status_var.set(f"Переключитесь в LanDocs… считывание через {n} сек.")
-            self.after(1000, self._reparse_countdown, n - 1)
-        else:
-            self._status_var.set("Считывание…")
-            self.after(50, self._do_reparse)
-
-    def _do_reparse(self):
         tab = self._active_tab()
-        try:
-            if tab == 'in':
-                self.in_data = extract_landocs_data_in()
-                self._apply_incoming_data()
-            else:
-                self.out_data = extract_landocs_data_out()
-                self._apply_outgoing_data()
-            self._status_var.set("Считывание завершено.")
-        except Exception as exc:
-            self._status_var.set(f"Ошибка: {exc}")
-        finally:
-            self._reparse_btn.config(state='normal')
-            self.deiconify()
-            self.lift()
+        self._status_var.set("Переключитесь в LanDocs… считывание через 3 сек.")
+        self.lower()  # Убрать окно на задний план (не minimize — просто опустить)
+        self.update()
+
+        def _worker():
+            time.sleep(3)
+            try:
+                if tab == 'in':
+                    data = extract_landocs_data_in()
+                else:
+                    data = extract_landocs_data_out()
+                # Передать результат в главный поток через after
+                self.after(0, self._finish_reparse, tab, data, None)
+            except Exception as exc:
+                self.after(0, self._finish_reparse, tab, None, str(exc))
+
+        self._parse_thread = threading.Thread(target=_worker, daemon=True)
+        self._parse_thread.start()
+
+    def _finish_reparse(self, tab: str, data, error: str):
+        """Вызывается в главном потоке по окончании считывания."""
+        self._reparse_btn.config(state='normal')
+        self.lift()     # Вернуть окно на передний план
+        self.focus_force()
+        if error:
+            self._status_var.set(f"Ошибка считывания: {error}")
+            messagebox.showerror("Ошибка LanDocs", error, parent=self)
+            return
+        if tab == 'in':
+            self.in_data = data
+            self._apply_incoming_data()
+        else:
+            self.out_data = data
+            self._apply_outgoing_data()
+        self._status_var.set("Считывание завершено.")
 
     # ── Выбор файла сохранения ────────────────────────────────────────────
 
@@ -677,20 +697,18 @@ class LetterRegisterApp(_BASE_CLASS):
             messagebox.showwarning("Внимание", "Выберите папку и имя файла.", parent=self)
             return
         d = self.in_data
-        # Подтверждение перед записью
         confirm_msg = (
             f"Зарегистрировать входящее письмо?\n\n"
-            f"  № вх:      {d.get('incoming_num','')}\n"
-            f"  Дата:      {d.get('date','')}\n"
-            f"  № письма:  {d.get('letter_num','')}\n"
-            f"  Тема:      {d.get('subject','')[:60]}\n\n"
+            f"  № вх:      {d.get('incoming_num', '')}\n"
+            f"  Дата:      {d.get('date', '')}\n"
+            f"  № письма:  {d.get('letter_num', '')}\n"
+            f"  Тема:      {d.get('subject', '')[:60]}\n\n"
             f"  Сохранить файл как:\n  {save_path}\n\n"
             f"  Журнал: {EXCEL_PATH_IN}"
         )
         if not messagebox.askyesno("Подтверждение", confirm_msg, parent=self):
             return
         try:
-            # Скопировать файл письма
             src = find_latest_in_viewdir()
             if src:
                 shutil.copy2(src, save_path)
@@ -702,20 +720,20 @@ class LetterRegisterApp(_BASE_CLASS):
                     parent=self,
                 ):
                     return
-            signatory     = d.get('signatory','')
-            correspondent = d.get('correspondent','')
+            signatory     = d.get('signatory', '')
+            correspondent = d.get('correspondent', '')
             signed_by = f"{signatory}\n{correspondent}".strip('\n') if correspondent else signatory
             write_to_excel_in({
-                'date':           fmt_date_ymd(d.get('date','')),
-                'incoming_num':   d.get('incoming_num',''),
-                'letter_num':     d.get('letter_num',''),
-                'subject':        d.get('subject',''),
+                'date':           fmt_date_ymd(d.get('date', '')),
+                'incoming_num':   d.get('incoming_num', ''),
+                'letter_num':     d.get('letter_num', ''),
+                'subject':        d.get('subject', ''),
                 'author':         self.in_author_var.get(),
                 'signed_by':      signed_by,
                 'folder_num':     self.in_folder_num_var.get(),
                 'who_registered': getpass.getuser(),
                 'keywords':       self.in_keywords_var.get(),
-                'related':        d.get('related',''),
+                'related':        d.get('related', ''),
                 'hyperlink_path': save_path,
             })
             self._save_current_session()
@@ -732,9 +750,9 @@ class LetterRegisterApp(_BASE_CLASS):
         d = self.out_data
         confirm_msg = (
             f"Зарегистрировать исходящее письмо?\n\n"
-            f"  № письма:  {d.get('letter_num','')}\n"
-            f"  Дата:      {d.get('date','')}\n"
-            f"  Тема:      {d.get('subject','')[:60]}\n\n"
+            f"  № письма:  {d.get('letter_num', '')}\n"
+            f"  Дата:      {d.get('date', '')}\n"
+            f"  Тема:      {d.get('subject', '')[:60]}\n\n"
             f"  Сохранить файл как:\n  {save_path}\n\n"
             f"  Журнал: {EXCEL_PATH_OUT}"
         )
@@ -753,14 +771,14 @@ class LetterRegisterApp(_BASE_CLASS):
                 ):
                     return
             write_to_excel_out({
-                'date':           fmt_date_dmy(d.get('date','')),
-                'letter_num':     d.get('letter_num',''),
-                'subject':        d.get('subject',''),
-                'recipient':      build_recipient_string(d.get('recipient_names',''),
-                                                         d.get('recipient_companies','')),
-                'executor':       d.get('executor',''),
+                'date':           fmt_date_dmy(d.get('date', '')),
+                'letter_num':     d.get('letter_num', ''),
+                'subject':        d.get('subject', ''),
+                'recipient':      build_recipient_string(d.get('recipient_names', ''),
+                                                         d.get('recipient_companies', '')),
+                'executor':       d.get('executor', ''),
                 'keywords':       self.out_keywords_var.get(),
-                'related':        d.get('related',''),
+                'related':        d.get('related', ''),
                 'control':        self.out_control_var.get(),
                 'hyperlink_path': save_path,
             })
@@ -781,13 +799,16 @@ class LetterRegisterApp(_BASE_CLASS):
         save_session(session)
         self._status_var.set("Сессия сохранена.")
 
+    def _on_destroy(self):
+        self._timer_running = False
+
     # ── Центровка ─────────────────────────────────────────────────────────
 
     def _center_window(self):
         self.update_idletasks()
         w, h = self.winfo_width(), self.winfo_height()
         sw, sh = self.winfo_screenwidth(), self.winfo_screenheight()
-        self.geometry(f"{max(w,700)}x{max(h,600)}+{(sw-max(w,700))//2}+{(sh-max(h,600))//2}")
+        self.geometry(f"{max(w, 700)}x{max(h, 600)}+{(sw - max(w, 700)) // 2}+{(sh - max(h, 600)) // 2}")
 
 
 # ── Точка входа ───────────────────────────────────────────────────────────────

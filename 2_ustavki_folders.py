@@ -31,11 +31,11 @@ from tkinter import ttk, filedialog, messagebox
 from datetime import datetime
 
 from shared_lib import (
-    REGISTRY_PATH, SUMMARY_PATH, USTAVKI_EXEC_BASE,
+    REGISTRY_PATH, SUMMARY_PATH, USTAVKI_EXEC_BASE, USTAVKI_ARCHIVE_BASE,
     OBJECT_SHORT_NAMES, EMPTY_USTAVKI_ENTRY,
     sanitize_for_filename, parse_date, fmt_date_ymd_underscore,
-    match_object_to_short_name, find_object_exec_folder,
-    find_current_and_archive_folders,
+    match_object_to_short_name, get_object_short_name_from_path,
+    find_object_exec_folder, find_current_and_archive_folders,
     load_session, save_session,
 )
 
@@ -294,22 +294,99 @@ def write_to_summary_old(entry: dict, incoming_letter_num: str,
 # ── Файловые операции ─────────────────────────────────────────────────────────
 
 def _normalize_name(s: str) -> str:
-    return re.sub(r'\s+', ' ', s.lower().replace('ё', 'е')).strip()
+    return re.sub(r'\s+', ' ', s.lower().replace('ё', 'е').replace('-', ' ')).strip()
+
+
+def _get_archive_object_folder(file_path: str) -> str:
+    """
+    Возвращает путь к папке объекта в Таблицы уставок РЗА.
+    Берёт имя объекта из родительской папки обрабатываемого файла.
+    Пример:
+      file_path = ...\\Таблицы для исполнения РЗА\\Волна\\Текущие\\файл.docx
+      → возвращает  ...\\Таблицы уставок РЗА\\Волна
+    """
+    # Имя папки-объекта = папка-дедушка или папка-родитель файла
+    # Ищем ближайшую к файлу папку, имя которой есть в OBJECT_SHORT_NAMES
+    obj_short = get_object_short_name_from_path(file_path)
+    if not obj_short:
+        # Fallback: просто берём родительскую папку
+        obj_short = os.path.basename(os.path.dirname(file_path))
+    if not obj_short:
+        return ''
+    archive_folder = os.path.join(USTAVKI_ARCHIVE_BASE, obj_short)
+    return archive_folder
+
+
+def find_archive_candidates_by_filename(new_filepath: str, top_n: int = 5) -> list:
+    """
+    Вариант А: ищет кандидата на архив по схожести ИМЕНИ ФАЙЛА.
+    Смотрит в папку \\Таблицы уставок РЗА\\Объект\\.
+    Возвращает список (path, name, score).
+    """
+    archive_folder = _get_archive_object_folder(new_filepath)
+    if not archive_folder or not os.path.isdir(archive_folder):
+        return []
+    new_stem = _normalize_name(os.path.splitext(os.path.basename(new_filepath))[0])
+    candidates = []
+    try:
+        for entry in os.scandir(archive_folder):
+            if not entry.is_file():
+                continue
+            stem = _normalize_name(os.path.splitext(entry.name)[0])
+            score = difflib.SequenceMatcher(None, new_stem, stem).ratio()
+            candidates.append((entry.path, entry.name, score))
+    except OSError:
+        pass
+    candidates.sort(key=lambda x: x[2], reverse=True)
+    return candidates[:top_n]
+
+
+def find_archive_candidates_by_dispatch(new_filepath: str, dispatch_name: str,
+                                        top_n: int = 5) -> list:
+    """
+    Вариант Б: ищет кандидата на архив по схожести ДИСПЕТЧЕРСКОГО НАИМЕНОВАНИЯ.
+    Парсирует dispatch_name из каждого файла в \\Таблицы уставок РЗА\\Объект\\
+    и выбирает наиболее похожее на dispatch_name обрабатываемой таблицы.
+    Возвращает список (path, name, score, parsed_dispatch).
+    """
+    if not HAS_DOCX:
+        return []
+    archive_folder = _get_archive_object_folder(new_filepath)
+    if not archive_folder or not os.path.isdir(archive_folder):
+        return []
+    norm_dispatch = _normalize_name(dispatch_name)
+    candidates = []
+    try:
+        for entry in os.scandir(archive_folder):
+            if not entry.is_file() or not entry.name.lower().endswith(('.docx', '.doc')):
+                continue
+            try:
+                parsed = parse_ustavki_table(entry.path)
+                candidate_dispatch = parsed.get('dispatch_name', '') or parsed.get('object_name', '')
+                norm_cd = _normalize_name(candidate_dispatch)
+                score = difflib.SequenceMatcher(None, norm_dispatch, norm_cd).ratio()
+                candidates.append((entry.path, entry.name, score, candidate_dispatch))
+            except Exception:
+                # Если файл нельзя прочитать — пропускаем
+                continue
+    except OSError:
+        pass
+    candidates.sort(key=lambda x: x[2], reverse=True)
+    return candidates[:top_n]
 
 
 def find_archive_candidates(new_filepath: str, current_dir: str, top_n: int = 5) -> list:
+    """Обратная совместимость: поиск по имени файла в указанной папке."""
     if not current_dir or not os.path.isdir(current_dir):
         return []
-    new_stem = os.path.splitext(os.path.basename(new_filepath))[0]
-    new_trimmed = _normalize_name(new_stem[:-5] if len(new_stem) > 5 else new_stem)
+    new_stem = _normalize_name(os.path.splitext(os.path.basename(new_filepath))[0])
     candidates = []
     try:
         for entry in os.scandir(current_dir):
             if not entry.is_file():
                 continue
-            stem = os.path.splitext(entry.name)[0]
-            trimmed = _normalize_name(stem[:-5] if len(stem) > 5 else stem)
-            score = difflib.SequenceMatcher(None, new_trimmed, trimmed).ratio()
+            stem = _normalize_name(os.path.splitext(entry.name)[0])
+            score = difflib.SequenceMatcher(None, new_stem, stem).ratio()
             candidates.append((entry.path, entry.name, score))
     except OSError:
         pass
@@ -567,19 +644,21 @@ class UstavkiFoldersApp(_BASE_CLASS):
         parent.columnconfigure(0, weight=1)
         parent.rowconfigure(1, weight=1)
         ttk.Label(parent,
-            text="Ищет похожие файлы в папках «Текущие» объектов и предлагает кандидатов для архивации.\n"
+            text="Ищет кандидата на архив в папке \\\\Prim-fs-serv\\...\\Таблицы уставок РЗА\\Объект\\\n"
+                 "А — по схожести имени файла   |   Б — по схожести диспетчерского наименования\n"
                  "Двойной клик — выбрать другого кандидата из списка.",
-            wraplength=700, foreground='gray').grid(row=0, column=0, sticky='w', pady=(0,4))
+            wraplength=700, foreground='gray').grid(row=0, column=0, sticky='w', pady=(0, 4))
         af = ttk.Frame(parent)
         af.grid(row=1, column=0, sticky='nsew')
         af.columnconfigure(0, weight=1)
         af.rowconfigure(0, weight=1)
-        arc_cols = ('file','short','candidate','score')
+        arc_cols = ('file', 'short', 'candidate', 'score', 'method')
         self._arc_tree = ttk.Treeview(af, columns=arc_cols, show='headings', height=12)
-        self._arc_tree.heading('file',      text='Новый файл');       self._arc_tree.column('file',      width=180)
-        self._arc_tree.heading('short',     text='Объект (папка)');   self._arc_tree.column('short',     width=120)
-        self._arc_tree.heading('candidate', text='Кандидат на архив');self._arc_tree.column('candidate', width=220)
-        self._arc_tree.heading('score',     text='Схожесть');         self._arc_tree.column('score',     width=70)
+        self._arc_tree.heading('file',      text='Новый файл');        self._arc_tree.column('file',      width=180)
+        self._arc_tree.heading('short',     text='Объект (папка)');    self._arc_tree.column('short',     width=110)
+        self._arc_tree.heading('candidate', text='Кандидат на архив'); self._arc_tree.column('candidate', width=220)
+        self._arc_tree.heading('score',     text='Схожесть');          self._arc_tree.column('score',     width=65)
+        self._arc_tree.heading('method',    text='Метод');             self._arc_tree.column('method',    width=50)
         vsb = ttk.Scrollbar(af, orient='vertical',   command=self._arc_tree.yview)
         hsb = ttk.Scrollbar(af, orient='horizontal', command=self._arc_tree.xview)
         self._arc_tree.configure(yscrollcommand=vsb.set, xscrollcommand=hsb.set)
@@ -588,9 +667,13 @@ class UstavkiFoldersApp(_BASE_CLASS):
         hsb.grid(row=1, column=0, sticky='ew')
         self._arc_tree.bind('<Double-1>', self._on_arc_dclick)
         bf = ttk.Frame(parent)
-        bf.grid(row=2, column=0, pady=(6,0), sticky='w')
-        ttk.Button(bf, text="Найти кандидатов", command=self._find_candidates).pack(side='left', padx=4)
-        ttk.Button(bf, text="Разложить файлы",  command=self._move_files).pack(side='left', padx=4)
+        bf.grid(row=2, column=0, pady=(6, 0), sticky='w')
+        ttk.Button(bf, text="А: Найти кандидатов по имени файла",
+                   command=self._find_candidates_a).pack(side='left', padx=4)
+        ttk.Button(bf, text="Б: Найти кандидатов по дисп. наим.",
+                   command=self._find_candidates_b).pack(side='left', padx=4)
+        ttk.Button(bf, text="Разложить файлы",
+                   command=self._move_files).pack(side='left', padx=4)
 
     # ── Логирование ───────────────────────────────────────────────────────
 
@@ -855,26 +938,50 @@ class UstavkiFoldersApp(_BASE_CLASS):
 
     # ── Шаг 4: раскладка ─────────────────────────────────────────────────
 
-    def _find_candidates(self):
+    def _fill_exec_dirs(self, entry: dict):
+        """Заполняет _current_dir/_archive_dir по пути файла (папка объекта)."""
+        short = get_object_short_name_from_path(entry['file_path'])
+        if not short:
+            obj = entry.get('object_name', '')
+            short = match_object_to_short_name(obj) if obj else ''
+        entry['short_name'] = short
+        folder = find_object_exec_folder(short) if short else None
+        current_dir, archive_dir = find_current_and_archive_folders(folder) if folder else (None, None)
+        entry['_current_dir'] = current_dir or ''
+        entry['_archive_dir'] = archive_dir or ''
+        return short
+
+    def _find_candidates_a(self):
+        """Вариант А: кандидат по схожести ИМЕНИ ФАЙЛА в Таблицы уставок РЗА\\Объект."""
         self._arc_tree.delete(*self._arc_tree.get_children())
         for entry in self.ustavki_entries:
-            obj   = entry.get('object_name', '')
-            short = match_object_to_short_name(obj)
-            folder = find_object_exec_folder(short) if short else None
-            current_dir, archive_dir = find_current_and_archive_folders(folder) if folder else (None, None)
-            candidates = find_archive_candidates(entry['file_path'], current_dir or '') if current_dir else []
-
+            short = self._fill_exec_dirs(entry)
+            candidates = find_archive_candidates_by_filename(entry['file_path'])
             top = candidates[0] if candidates else ('', '', 0.0)
-            entry['archive_candidate']  = top[0]
-            entry['short_name']         = short
-            entry['_current_dir']       = current_dir or ''
-            entry['_archive_dir']       = archive_dir or ''
-
+            entry['archive_candidate'] = top[0]
             self._arc_tree.insert('', 'end', values=(
                 os.path.basename(entry['file_path']),
                 short,
                 top[1] if top else '',
                 f"{top[2]:.2f}" if len(top) > 2 else '',
+                'А',
+            ))
+
+    def _find_candidates_b(self):
+        """Вариант Б: кандидат по схожести ДИСПЕТЧЕРСКОГО НАИМЕНОВАНИЯ."""
+        self._arc_tree.delete(*self._arc_tree.get_children())
+        for entry in self.ustavki_entries:
+            short = self._fill_exec_dirs(entry)
+            dispatch = entry.get('dispatch_name', '') or entry.get('object_name', '')
+            candidates = find_archive_candidates_by_dispatch(entry['file_path'], dispatch)
+            top = candidates[0] if candidates else ('', '', 0.0, '')
+            entry['archive_candidate'] = top[0]
+            self._arc_tree.insert('', 'end', values=(
+                os.path.basename(entry['file_path']),
+                short,
+                top[1] if top else '',
+                f"{top[2]:.2f}" if len(top) > 2 else '',
+                'Б',
             ))
 
     def _on_arc_dclick(self, event):
@@ -890,25 +997,42 @@ class UstavkiFoldersApp(_BASE_CLASS):
         if idx >= len(self.ustavki_entries):
             return
         entry = self.ustavki_entries[idx]
-        current_dir = entry.get('_current_dir', '')
-        if not current_dir:
-            return
-        candidates = find_archive_candidates(entry['file_path'], current_dir, top_n=10)
-        if not candidates:
+
+        # Собираем кандидатов из обоих источников
+        cands_a = find_archive_candidates_by_filename(entry['file_path'], top_n=10)
+        dispatch = entry.get('dispatch_name', '') or entry.get('object_name', '')
+        cands_b = find_archive_candidates_by_dispatch(entry['file_path'], dispatch, top_n=10) if HAS_DOCX else []
+
+        # Объединяем: (path, name, score, method)
+        seen = set()
+        all_cands = []
+        for path, name, score in cands_a:
+            if path not in seen:
+                seen.add(path)
+                all_cands.append((path, name, score, 'А'))
+        for path, name, score, _ in cands_b:
+            if path not in seen:
+                seen.add(path)
+                all_cands.append((path, name, score, 'Б'))
+        all_cands.sort(key=lambda x: x[2], reverse=True)
+
+        if not all_cands:
             messagebox.showinfo("Кандидаты", "Похожих файлов не найдено.", parent=self)
             return
+
         dlg = tk.Toplevel(self)
         dlg.title("Выбор архивной таблицы")
         dlg.grab_set()
         ttk.Label(dlg,
                   text=f"Кандидаты для:\n{os.path.basename(entry['file_path'])}",
-                  wraplength=460, font=('','10','bold')).pack(padx=12, pady=(10,4))
-        cols2 = ('name', 'score')
-        tv = ttk.Treeview(dlg, columns=cols2, show='headings', height=8)
-        tv.heading('name', text='Имя файла');  tv.column('name', width=340)
-        tv.heading('score', text='Схожесть'); tv.column('score', width=70)
-        for cpath, cname, cscore in candidates:
-            tv.insert('', 'end', iid=cpath, values=(cname, f"{cscore:.2f}"))
+                  wraplength=460, font=('', '10', 'bold')).pack(padx=12, pady=(10, 4))
+        cols2 = ('name', 'score', 'method')
+        tv = ttk.Treeview(dlg, columns=cols2, show='headings', height=10)
+        tv.heading('name',   text='Имя файла');   tv.column('name',   width=320)
+        tv.heading('score',  text='Схожесть');    tv.column('score',  width=70)
+        tv.heading('method', text='Метод');       tv.column('method', width=50)
+        for cpath, cname, cscore, method in all_cands:
+            tv.insert('', 'end', iid=cpath, values=(cname, f"{cscore:.2f}", method))
         tv.pack(padx=12, fill='both', expand=True)
 
         def _pick():
