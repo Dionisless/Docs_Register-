@@ -65,8 +65,70 @@ except Exception:
 
 # ── Парсинг таблиц .docx ─────────────────────────────────────────────────────
 
+def _parse_table_number_str(table_num: str) -> tuple | None:
+    """
+    Разбирает строку вида 'YY-NNN' или 'ПРДУ-РЗ-YY-NNN'.
+    Возвращает (year_2digit, number) или None.
+    """
+    m = re.search(r'(\d{2})-(\d+)', table_num)
+    if m:
+        return int(m.group(1)), int(m.group(2))
+    return None
+
+
+def _is_old_form_by_number(table_num: str) -> bool:
+    """
+    Старая форма: год (YY) <= 25 И номер (NNN) <= 470.
+    Примеры: 25-450 → старая, 24-1000 → старая, 25-471 → новая, 26-1 → новая.
+    """
+    parsed = _parse_table_number_str(table_num)
+    if parsed is None:
+        return False
+    year, num = parsed
+    return year <= 25 and num <= 470
+
+
+def _extract_table_num_raw(doc_path: str, doc=None) -> str:
+    """
+    Пытается извлечь строку номера таблицы (YY-NNN) из:
+    1) имени файла  (паттерн -YY-NNN( или _YY-NNN_)
+    2) первого абзаца документа (ПРДУ-РЗ-YY-NNN)
+    """
+    fname = os.path.basename(doc_path)
+    m = re.search(r'[-_](\d{2}-\d+)[(\s_]', fname)
+    if m:
+        return m.group(1)
+    # Из абзацев — ПРДУ-РЗ-YY-NNN
+    if doc is None:
+        try:
+            doc = DocxDocument(doc_path)
+        except Exception:
+            return ''
+    for p in doc.paragraphs[:5]:
+        m2 = re.search(r'ПРДУ-РЗ-(\d{2}-\d+)', p.text)
+        if m2:
+            return m2.group(1)
+    return ''
+
+
 def detect_table_form(doc_path: str) -> str:
-    doc = DocxDocument(doc_path)
+    """
+    Определяет форму таблицы уставок.
+    Если удаётся извлечь номер — решение по правилу:
+      старая: год(YY) <= 25 И номер(NNN) <= 470
+      новая: иначе
+    Если номер не найден — структурная эвристика (fallback).
+    """
+    try:
+        doc = DocxDocument(doc_path)
+    except Exception:
+        return 'unknown'
+
+    num_raw = _extract_table_num_raw(doc_path, doc)
+    if num_raw:
+        return 'old' if _is_old_form_by_number(num_raw) else 'new'
+
+    # Fallback: структурная проверка
     if not doc.tables:
         return 'unknown'
     t = doc.tables[0]
