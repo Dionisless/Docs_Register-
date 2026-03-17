@@ -999,13 +999,36 @@ class UstavkiFoldersApp(_BASE_CLASS):
     # ── Шаг 4: раскладка ─────────────────────────────────────────────────
 
     def _fill_exec_dirs(self, entry: dict):
-        """Заполняет _current_dir/_archive_dir по пути файла (папка объекта)."""
+        """
+        Заполняет _current_dir/_archive_dir.
+
+        Стратегия:
+        1. Определить краткое имя объекта (из пути файла → из object_name → имя родит. папки)
+        2. Найти папку объекта в USTAVKI_EXEC_BASE
+        3. Если не найдена — fallback: ищем «Текущие»/«Архив» прямо в родительской папке файла
+        """
         short = get_object_short_name_from_path(entry['file_path'])
         if not short:
             obj = entry.get('object_name', '')
             short = match_object_to_short_name(obj) if obj else ''
+        if not short:
+            # Fallback: имя родительской папки файла
+            short = os.path.basename(os.path.dirname(entry['file_path']))
         entry['short_name'] = short
+
         folder = find_object_exec_folder(short) if short else None
+
+        # Fallback: если объект не найден в USTAVKI_EXEC_BASE —
+        # ищем Текущие/Архив в родительской папке самого файла
+        if not folder:
+            parent = os.path.dirname(entry['file_path'])
+            # Если файл уже лежит в «Текущие» — берём её родителя как папку объекта
+            parent_name = os.path.basename(parent).lower()
+            if 'текущ' in parent_name or 'архив' in parent_name:
+                folder = os.path.dirname(parent)
+            else:
+                folder = parent
+
         current_dir, archive_dir = find_current_and_archive_folders(folder) if folder else (None, None)
         entry['_current_dir'] = current_dir or ''
         entry['_archive_dir'] = archive_dir or ''
