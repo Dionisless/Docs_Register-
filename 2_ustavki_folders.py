@@ -545,6 +545,7 @@ class UstavkiFoldersApp(_BASE_CLASS):
         super().__init__()
         self.ustavki_entries: list = []
         self.in_data: dict = {}
+        self._candidates_found: bool = False   # True после нажатия «Найти кандидатов»
 
         # Загрузить сессию
         session = load_session()
@@ -1012,6 +1013,7 @@ class UstavkiFoldersApp(_BASE_CLASS):
 
     def _find_candidates_a(self):
         """Вариант А: кандидат по схожести ИМЕНИ ФАЙЛА в Таблицы уставок РЗА\\Объект."""
+        self._candidates_found = True
         self._arc_tree.delete(*self._arc_tree.get_children())
         for entry in self.ustavki_entries:
             short = self._fill_exec_dirs(entry)
@@ -1108,23 +1110,31 @@ class UstavkiFoldersApp(_BASE_CLASS):
         dlg.wait_window()
 
     def _move_files(self):
-        # Подтверждение с показом что куда
-        lines = []
-        for entry in self.ustavki_entries:
-            cd = entry.get('_current_dir', '')
-            ad = entry.get('_archive_dir', '')
-            if not cd or not ad:
-                continue
-            arc = entry.get('archive_candidate', '')
-            lines.append(
-                f"  {os.path.basename(entry['file_path'])}\n"
-                f"    → Текущие: {cd}\n"
-                + (f"    архивировать: {os.path.basename(arc)}\n    → Архив: {ad}\n" if arc else '')
-            )
-        if not lines:
+        # Проверка: была ли нажата кнопка «Найти кандидатов»
+        if not self._candidates_found:
             messagebox.showwarning("Нет данных",
                 "Сначала нажмите «Найти кандидатов на архив».", parent=self)
             return
+
+        if not self.ustavki_entries:
+            messagebox.showwarning("Нет файлов",
+                "Список записей пуст. Добавьте файлы на шаге 0.", parent=self)
+            return
+
+        # Строим список операций для подтверждения
+        lines = []
+        for entry in self.ustavki_entries:
+            cd  = entry.get('_current_dir', '')
+            ad  = entry.get('_archive_dir', '')
+            arc = entry.get('archive_candidate', '')
+            fn  = os.path.basename(entry['file_path'])
+            if cd and ad:
+                lines.append(
+                    f"  {fn}\n    → Текущие: {cd}\n"
+                    + (f"    архивировать: {os.path.basename(arc)}\n    → Архив: {ad}\n" if arc else '')
+                )
+            else:
+                lines.append(f"  {fn}  [папки объекта не найдены — будет пропущено]")
         msg = "Разложить файлы?\n\n" + '\n'.join(lines[:10])
         if len(lines) > 10:
             msg += f"\n...и ещё {len(lines)-10} файл(ов)"
