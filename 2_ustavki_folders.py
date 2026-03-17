@@ -1061,7 +1061,7 @@ class UstavkiFoldersApp(_BASE_CLASS):
             )
         if not lines:
             messagebox.showwarning("Нет данных",
-                "Сначала нажмите «Найти кандидатов».", parent=self)
+                "Сначала нажмите «Найти кандидатов на архив».", parent=self)
             return
         msg = "Разложить файлы?\n\n" + '\n'.join(lines[:10])
         if len(lines) > 10:
