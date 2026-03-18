@@ -23,9 +23,16 @@ import json
 import time
 import shutil
 import getpass
+import subprocess
 import tkinter as tk
 from tkinter import ttk, filedialog, messagebox
 from datetime import datetime
+
+
+def _resource_path(rel: str) -> str:
+    """Возвращает путь к файлу ресурса (корректно работает в замороженном exe)."""
+    base = getattr(sys, '_MEIPASS', os.path.dirname(os.path.abspath(__file__)))
+    return os.path.join(base, rel)
 
 # ── Зависимости ──────────────────────────────────────────────────────────────
 
@@ -77,6 +84,7 @@ SETTINGS_FILE = os.path.join(_appdata_dir(), 'letter_settings.json')
 _settings: dict = {
     'org_abbreviations': {},
     'registrar_name': '',
+    'ustavki_exe_path': '',
 }
 
 def load_settings():
@@ -387,7 +395,7 @@ class SettingsWindow(tk.Toplevel):
         self.columnconfigure(0, weight=1)
         self.rowconfigure(0, weight=1)
         f.columnconfigure(1, weight=1)
-        f.rowconfigure(4, weight=1)
+        f.rowconfigure(8, weight=1)
 
         # Имя регистратора
         ttk.Label(f, text="Имя регистратора (столбец H входящих):").grid(
@@ -398,14 +406,27 @@ class SettingsWindow(tk.Toplevel):
         ttk.Label(f, text="(Оставьте пустым — будет использоваться системное имя пользователя)",
                   foreground='gray').grid(row=1, column=0, columnspan=2, sticky='w', pady=(0, 12))
 
+        # Путь к программе "Таблицы уставок"
+        ttk.Label(f, text="Программа «Таблицы уставок» (.exe):").grid(
+            row=2, column=0, sticky='e', padx=(0, 6), pady=(0, 4))
+        exe_frame = ttk.Frame(f)
+        exe_frame.grid(row=2, column=1, sticky='ew', pady=(0, 4))
+        exe_frame.columnconfigure(0, weight=1)
+        self._ustavki_exe_var = tk.StringVar(value=_settings.get('ustavki_exe_path', ''))
+        ttk.Entry(exe_frame, textvariable=self._ustavki_exe_var).grid(row=0, column=0, sticky='ew')
+        ttk.Button(exe_frame, text="…", width=3,
+                   command=self._browse_ustavki_exe).grid(row=0, column=1, padx=(4, 0))
+        ttk.Label(f, text="(путь к 2_UstavkiFolders.exe — для кнопки «→ Таблицы уставок»)",
+                  foreground='gray').grid(row=3, column=0, columnspan=2, sticky='w', pady=(0, 12))
+
         # Сокращения организаций
         ttk.Label(f, text="Сокращения организаций:").grid(
-            row=2, column=0, columnspan=2, sticky='w', pady=(0, 2))
+            row=4, column=0, columnspan=2, sticky='w', pady=(0, 2))
         ttk.Label(f, text="Формат:  Полное название организации = Сокращение",
-                  foreground='gray').grid(row=3, column=0, columnspan=2, sticky='w', pady=(0, 4))
+                  foreground='gray').grid(row=5, column=0, columnspan=2, sticky='w', pady=(0, 4))
 
         txt_frame = ttk.Frame(f)
-        txt_frame.grid(row=4, column=0, columnspan=2, sticky='nsew', pady=(0, 8))
+        txt_frame.grid(row=6, column=0, columnspan=2, sticky='nsew', pady=(0, 8))
         txt_frame.columnconfigure(0, weight=1)
         txt_frame.rowconfigure(0, weight=1)
 
@@ -425,9 +446,18 @@ class SettingsWindow(tk.Toplevel):
 
         # Кнопки
         btn_frame = ttk.Frame(f)
-        btn_frame.grid(row=5, column=0, columnspan=2, pady=(4, 0))
+        btn_frame.grid(row=7, column=0, columnspan=2, pady=(4, 0))
         ttk.Button(btn_frame, text="Сохранить", command=self._save).pack(side='left', padx=6)
         ttk.Button(btn_frame, text="Отмена", command=self.destroy).pack(side='left', padx=6)
+
+    def _browse_ustavki_exe(self):
+        path = filedialog.askopenfilename(
+            title="Выберите 2_UstavkiFolders.exe",
+            filetypes=[("Исполняемые файлы", "*.exe"), ("Все файлы", "*.*")],
+            parent=self,
+        )
+        if path:
+            self._ustavki_exe_var.set(path)
 
     def _save(self):
         lines = self._abbr_text.get('1.0', 'end').strip().splitlines()
@@ -443,6 +473,7 @@ class SettingsWindow(tk.Toplevel):
                     abbrs[key] = val
         _settings['org_abbreviations'] = abbrs
         _settings['registrar_name'] = self._reg_var.get().strip()
+        _settings['ustavki_exe_path'] = self._ustavki_exe_var.get().strip()
         save_settings()
         self.destroy()
 
@@ -461,6 +492,10 @@ class RegistrationApp(tk.Tk):
 
         self.title("Регистрация корреспонденции")
         self.resizable(True, True)
+        try:
+            self.iconbitmap(_resource_path('icons/1_letter.ico'))
+        except Exception:
+            pass
         self._build_ui()
         self._center_window()
 
@@ -494,6 +529,8 @@ class RegistrationApp(tk.Tk):
         self._reparse_btn = ttk.Button(btn_frame, text="Считать из LanDocs заново",
                                        command=self._start_reparse)
         self._reparse_btn.pack(side='left', padx=6)
+        ttk.Button(btn_frame, text="→ Таблицы уставок",
+                   command=self._launch_ustavki).pack(side='left', padx=6)
         ttk.Button(btn_frame, text="Настройки",
                    command=self._open_settings).pack(side='left', padx=6)
         ttk.Button(btn_frame, text="Закрыть",
@@ -817,6 +854,44 @@ class RegistrationApp(tk.Tk):
 
     def _open_settings(self):
         SettingsWindow(self)
+
+    # ── Запуск таблиц уставок ─────────────────────────────────────────────
+
+    def _launch_ustavki(self):
+        exe_path = _settings.get('ustavki_exe_path', '').strip()
+        if not exe_path or not os.path.exists(exe_path):
+            messagebox.showwarning(
+                "Путь не задан",
+                "Укажите путь к программе «Таблицы уставок» (2_UstavkiFolders.exe) в Настройках.",
+                parent=self)
+            return
+        # Сохраняем текущие данные входящего письма в session_data.json
+        d = self.in_data
+        sess_file = os.path.join(_appdata_dir(), 'session_data.json')
+        try:
+            if os.path.exists(sess_file):
+                with open(sess_file, 'r', encoding='utf-8') as f:
+                    sess = json.load(f)
+            else:
+                sess = {}
+        except Exception:
+            sess = {}
+        sess['letter'] = {'in_data': {
+            'incoming_num': d.get('incoming_num', ''),
+            'letter_num':   d.get('letter_num', ''),
+            'date':         d.get('date', ''),
+            'file_link':    d.get('file_link', ''),
+        }}
+        try:
+            with open(sess_file, 'w', encoding='utf-8') as f:
+                json.dump(sess, f, ensure_ascii=False, indent=2)
+        except Exception as exc:
+            messagebox.showerror("Ошибка", f"Не удалось сохранить сессию: {exc}", parent=self)
+            return
+        try:
+            subprocess.Popen([exe_path])
+        except Exception as exc:
+            messagebox.showerror("Ошибка запуска", str(exc), parent=self)
 
     # ── Центровка ─────────────────────────────────────────────────────────
 

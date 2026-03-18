@@ -30,6 +30,11 @@ import tkinter as tk
 from tkinter import ttk, filedialog, messagebox
 from datetime import datetime
 
+
+def _resource_path(rel: str) -> str:
+    base = getattr(sys, '_MEIPASS', os.path.dirname(os.path.abspath(__file__)))
+    return os.path.join(base, rel)
+
 from shared_lib import (
     REGISTRY_PATH, SUMMARY_PATH, USTAVKI_EXEC_BASE, USTAVKI_ARCHIVE_BASE,
     USTAVKI_REAL_ARCHIVE_BASE,
@@ -559,6 +564,10 @@ class UstavkiFoldersApp(_BASE_CLASS):
 
         self.title("Таблицы уставок — Раскладка по папкам  v2")
         self.resizable(True, True)
+        try:
+            self.iconbitmap(_resource_path('icons/2_folders.ico'))
+        except Exception:
+            pass
         self._build_ui()
         self._center_window()
 

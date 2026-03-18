@@ -35,6 +35,8 @@ def build_exe(script, name, extra_data=None, extra_args=None, icon=None):
 
     if icon:
         cmd.append(f"--icon={to_win(icon)}")
+        # Кладём ico в папку icons/ внутри exe, чтобы iconbitmap() нашёл его в _MEIPASS
+        cmd.append(f"--add-data={to_win(icon)}:icons")
 
     if extra_args:
         cmd.extend(extra_args)

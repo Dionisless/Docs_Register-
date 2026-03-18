@@ -25,6 +25,11 @@ import tkinter as tk
 from tkinter import ttk, filedialog, messagebox
 from datetime import datetime
 
+
+def _resource_path(rel: str) -> str:
+    base = getattr(sys, '_MEIPASS', os.path.dirname(os.path.abspath(__file__)))
+    return os.path.join(base, rel)
+
 from shared_lib import (
     MAPS_FOLDER, MAPS_PDF_FOLDER, USTAVKI_ARCHIVE_BASE,
     EMPTY_USTAVKI_ENTRY, match_object_to_short_name,
@@ -213,6 +218,10 @@ class UstavkiMapApp(_BASE_CLASS):
 
         self.title("Таблицы уставок — Карты (Visio)  v2")
         self.resizable(True, True)
+        try:
+            self.iconbitmap(_resource_path('icons/3_map.ico'))
+        except Exception:
+            pass
         self._build_ui()
         self._center_window()
 
