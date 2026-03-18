@@ -1,7 +1,7 @@
 @echo off
 chcp 65001 > nul
 echo ============================================================
-echo  Сборка landocs_register.exe
+echo  Сборка 2_UstavkiFolders.exe
 echo ============================================================
 echo.
 
@@ -14,37 +14,39 @@ if errorlevel 1 (
 )
 
 :: Устанавливаем зависимости
-echo [1/4] Установка зависимостей...
-pip install pywin32 openpyxl pyinstaller python-docx tkinterdnd2 selenium pyautogui
+echo [1/5] Установка зависимостей...
+pip install pywin32 openpyxl pyinstaller python-docx tkinterdnd2 lxml selenium pyautogui
 if errorlevel 1 (
     echo ОШИБКА: Не удалось установить зависимости.
     pause
     exit /b 1
 )
 
-:: Запускаем post-install для pywin32 (регистрирует DLL)
+:: Запускаем post-install для pywin32
 python -m pywin32_postinstall -install >nul 2>&1
 
-:: Определяем путь к tkinterdnd2 для включения в сборку
+:: Определяем путь к tkinterdnd2
 echo.
-echo [2/4] Поиск пакета tkinterdnd2...
+echo [2/5] Поиск пакета tkinterdnd2...
 for /f "delims=" %%i in ('python -c "import tkinterdnd2, os; print(os.path.dirname(tkinterdnd2.__file__))"') do set TKDND_PATH=%%i
 echo  Найден: %TKDND_PATH%
 
-:: Собираем .exe
+:: Собираем exe
 echo.
-echo [3/4] Сборка .exe через PyInstaller...
+echo [3/5] Сборка 2_UstavkiFolders.exe через PyInstaller...
 pyinstaller ^
     --onefile ^
     --windowed ^
-    --name "LanDocs_Registrator" ^
-    --icon NONE ^
+    --name "2_UstavkiFolders" ^
     --add-data "%TKDND_PATH%;tkinterdnd2" ^
     --hidden-import "tkinterdnd2" ^
     --hidden-import "docx" ^
+    --hidden-import "lxml" ^
     --hidden-import "selenium" ^
     --hidden-import "pyautogui" ^
-    landocs_register.py
+    --hidden-import "win32com.client" ^
+    --hidden-import "win32clipboard" ^
+    2_ustavki_folders.py
 
 if errorlevel 1 (
     echo ОШИБКА: Сборка не удалась. Смотрите лог выше.
@@ -52,11 +54,25 @@ if errorlevel 1 (
     exit /b 1
 )
 
+:: Копируем yandexdriver.exe рядом с exe (если он есть)
 echo.
-echo [4/4] Готово!
-echo  Исполняемый файл: dist\LanDocs_Registrator.exe
+echo [4/5] Проверка yandexdriver.exe...
+if exist "yandexdriver.exe" (
+    copy /y "yandexdriver.exe" "dist\yandexdriver.exe" >nul
+    echo  Скопирован yandexdriver.exe в dist\
+) else (
+    echo  ВНИМАНИЕ: yandexdriver.exe не найден в текущей папке.
+    echo  Скачайте с https://yandex.ru/dev/yandexdriver/ и положите рядом с exe.
+)
+
 echo.
-echo  Скопируйте dist\LanDocs_Registrator.exe в удобное место
-echo  и настройте горячую клавишу через hotkey.ahk или ярлык.
+echo [5/5] Готово!
+echo.
+echo  Исполняемый файл: dist\2_UstavkiFolders.exe
+echo.
+echo  ВАЖНО: для работы вкладки "7 ДЭБ" необходимо:
+echo   - yandexdriver.exe рядом с exe
+echo     (скачать: https://yandex.ru/dev/yandexdriver/)
+echo   - Яндекс Браузер установлен (уже есть на целевом ПК)
 echo.
 pause

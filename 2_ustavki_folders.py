@@ -69,6 +69,35 @@ except Exception:
     HAS_DND = False
     _BASE_CLASS = tk.Tk
 
+try:
+    from selenium import webdriver
+    from selenium.webdriver.common.by import By
+    from selenium.webdriver.support.ui import WebDriverWait
+    from selenium.webdriver.support import expected_conditions as EC
+    from selenium.webdriver.chrome.options import Options as ChromeOptions
+    from selenium.webdriver.chrome.service import Service as ChromeService
+    HAS_SELENIUM = True
+except ImportError:
+    HAS_SELENIUM = False
+
+try:
+    import pyautogui
+    HAS_PYAUTOGUI = True
+except ImportError:
+    HAS_PYAUTOGUI = False
+
+try:
+    import win32clipboard
+    HAS_WIN32CLIP = True
+except ImportError:
+    HAS_WIN32CLIP = False
+
+# ── Константы ─────────────────────────────────────────────────────────────────
+
+DEB_BASE_URL = "https://pri-mdeb.oduvs.so"
+DEB_MAPS_URL = ("https://pri-mdeb.oduvs.so/?sid=02ab815f-a54e-42a5-8a88-36dee8a5af2e"
+                "&DataAreaId=1b6fecd6-f813-47ac-aa88-de4f67b7a1ac")
+
 # ── Парсинг таблиц .docx ─────────────────────────────────────────────────────
 
 def _parse_table_number_str(table_num: str) -> tuple | None:
@@ -638,6 +667,194 @@ def update_visio_map(visio_path: str, old_table_path: str,
             pass
 
 
+# ── ДЭБ: загрузка карт уставок ───────────────────────────────────────────────
+
+def _find_yandex_binary() -> str:
+    """Ищет исполняемый файл Яндекс Браузера на Windows."""
+    candidates = [
+        os.path.join(os.environ.get('LOCALAPPDATA', ''),
+                     r'Yandex\YandexBrowser\Application\browser.exe'),
+        os.path.join(os.environ.get('PROGRAMFILES', ''),
+                     r'Yandex\YandexBrowser\Application\browser.exe'),
+        os.path.join(os.environ.get('PROGRAMFILES(X86)', ''),
+                     r'Yandex\YandexBrowser\Application\browser.exe'),
+    ]
+    for c in candidates:
+        if c and os.path.exists(c):
+            return c
+    return ''
+
+
+def _find_webdriver(driver_path: str = '') -> 'ChromeService | None':
+    """
+    Ищет yandexdriver.exe / chromedriver.exe:
+    1. В явно заданном пути driver_path
+    2. Рядом с exe (или рядом со скриптом при запуске без сборки)
+    3. В PATH (возвращает None — selenium найдёт сам)
+    """
+    if driver_path and os.path.exists(driver_path):
+        return ChromeService(driver_path)
+    exe_dir = (os.path.dirname(sys.executable)
+               if getattr(sys, 'frozen', False)
+               else os.path.dirname(os.path.abspath(__file__)))
+    for name in ('yandexdriver.exe', 'chromedriver.exe',
+                 'yandexdriver', 'chromedriver'):
+        cand = os.path.join(exe_dir, name)
+        if os.path.exists(cand):
+            return ChromeService(cand)
+    return None
+
+
+def _clipboard_set(text: str):
+    """Кладёт текст в буфер обмена с поддержкой Unicode (через win32clipboard или tkinter)."""
+    if HAS_WIN32CLIP:
+        win32clipboard.OpenClipboard()
+        try:
+            win32clipboard.EmptyClipboard()
+            win32clipboard.SetClipboardText(text, win32clipboard.CF_UNICODETEXT)
+        finally:
+            win32clipboard.CloseClipboard()
+    else:
+        # Fallback через Tk — временное окно
+        try:
+            r = tk.Tk(); r.withdraw()
+            r.clipboard_clear(); r.clipboard_append(text); r.update()
+            r.after(300, r.destroy); r.mainloop()
+        except Exception:
+            pass
+
+
+def upload_to_deb_entry(dispatch_name: str, visio_path: str, pdf_path: str,
+                        driver_path: str = '') -> tuple:
+    """
+    Загружает файлы карты уставок в ДЭБ через Яндекс Браузер + Selenium.
+    Возвращает (success: bool, message: str).
+
+    driver_path — явный путь к yandexdriver.exe; если пустой — ищется
+                  рядом с exe или в PATH.
+    """
+    if not HAS_SELENIUM:
+        return False, "selenium не установлен (pip install selenium)"
+    if not HAS_PYAUTOGUI:
+        return False, "pyautogui не установлен (pip install pyautogui)"
+
+    opts = ChromeOptions()
+    yandex_bin = _find_yandex_binary()
+    if yandex_bin:
+        opts.binary_location = yandex_bin
+    opts.add_argument('--no-sandbox')
+    opts.add_argument('--disable-dev-shm-usage')
+    # Не закрывать браузер при ошибке — удобно для отладки
+    opts.add_experimental_option('detach', False)
+
+    service = _find_webdriver(driver_path) if HAS_SELENIUM else None
+    driver = None
+    try:
+        driver = (webdriver.Chrome(service=service, options=opts)
+                  if service else webdriver.Chrome(options=opts))
+        wait = WebDriverWait(driver, 30)
+
+        # 1. Открываем каталог ДЭБ
+        driver.get(DEB_MAPS_URL)
+        wait.until(EC.presence_of_element_located((By.CSS_SELECTOR, 'table tbody tr')))
+        time.sleep(1.0)
+
+        # 2. Ищем строку с нашим объектом
+        rows = driver.find_elements(By.CSS_SELECTOR, 'table tbody tr')
+        target_row = None
+        dn_low = dispatch_name.lower()
+        for row in rows:
+            try:
+                tds = row.find_elements(By.TAG_NAME, 'td')
+                for td in tds:
+                    if dn_low in td.text.lower():
+                        target_row = row
+                        break
+            except Exception:
+                pass
+            if target_row:
+                break
+
+        if not target_row:
+            driver.quit()
+            return False, f"Объект не найден в ДЭБ: {dispatch_name}"
+
+        # 3. Переходим по ссылке «Перейти по ссылке»
+        link_btn = target_row.find_element(By.CSS_SELECTOR, 'a[title="Перейти по ссылке"]')
+        href = link_btn.get_attribute('href') or ''
+        if href.startswith('/'):
+            card_url = DEB_BASE_URL + href
+        elif href.startswith('http'):
+            card_url = href
+        else:
+            card_url = DEB_BASE_URL + '/' + href.lstrip('./')
+        driver.execute_script("window.location.href = arguments[0];", card_url)
+        wait.until(EC.presence_of_element_located((By.CSS_SELECTOR, '.edit-mode-button')))
+        time.sleep(1.0)
+
+        # 4. Нажимаем «Редактировать»
+        driver.find_element(By.CSS_SELECTOR, 'button.edit-mode-button').click()
+        time.sleep(1.5)
+
+        # 5. Обрабатываем файловые строки (visio и pdf)
+        file_items = driver.find_elements(By.CSS_SELECTOR, '.list-group-item')
+        uploaded = []
+        for item in file_items:
+            try:
+                filename_el = item.find_element(By.CSS_SELECTOR, 'a.dz-filename')
+                fname_text = filename_el.text.lower()
+                is_visio = any(ext in fname_text for ext in ('.vsd', '.vsdx'))
+                is_pdf   = '.pdf' in fname_text
+                upload_path = visio_path if is_visio else (pdf_path if is_pdf else None)
+                if not upload_path or not os.path.exists(upload_path):
+                    continue
+
+                change_btn = item.find_element(By.CSS_SELECTOR, 'a.change-file-button')
+                change_btn.click()
+                time.sleep(0.8)
+
+                # Подтверждение (бывает только для visio-файла)
+                try:
+                    confirm_btn = WebDriverWait(driver, 4).until(
+                        EC.element_to_be_clickable((By.CSS_SELECTOR, 'button.btn.btn-success'))
+                    )
+                    confirm_btn.click()
+                    time.sleep(0.8)
+                except Exception:
+                    pass
+
+                # Ввод пути в диалог проводника
+                time.sleep(1.5)
+                _clipboard_set(upload_path)
+                time.sleep(0.3)
+                pyautogui.hotkey('ctrl', 'a')
+                time.sleep(0.1)
+                pyautogui.hotkey('ctrl', 'v')
+                time.sleep(0.3)
+                pyautogui.press('enter')
+                time.sleep(2.5)
+                uploaded.append(os.path.basename(upload_path))
+
+            except Exception:
+                continue
+
+        # 6. Сохранить
+        save_btn = driver.find_element(
+            By.CSS_SELECTOR, 'button.confirm-button.btn-outline-success')
+        save_btn.click()
+        time.sleep(2.0)
+        driver.quit()
+        return True, f"Загружено для «{dispatch_name}»: {', '.join(uploaded)}"
+
+    except Exception as exc:
+        try:
+            if driver:
+                driver.quit()
+        except Exception:
+            pass
+        return False, str(exc)
+
+
 # ── UI: диалог «Строка не найдена» ───────────────────────────────────────────
 
 class _RegistryNotFoundDialog(tk.Toplevel):
@@ -776,6 +993,7 @@ class UstavkiFoldersApp(_BASE_CLASS):
         step4 = ttk.Frame(self._step_nb, padding=8)
         step5 = ttk.Frame(self._step_nb, padding=8)
         step6 = ttk.Frame(self._step_nb, padding=8)
+        step7 = ttk.Frame(self._step_nb, padding=8)
         self._step_nb.add(step0, text=" 0 Файлы ")
         self._step_nb.add(step1, text=" 1 Данные ")
         self._step_nb.add(step2, text=" 2 → .docx ")
@@ -783,6 +1001,7 @@ class UstavkiFoldersApp(_BASE_CLASS):
         self._step_nb.add(step4, text=" 4 Раскладка ")
         self._step_nb.add(step5, text=" 5 Изменения ")
         self._step_nb.add(step6, text=" 6 Карты Visio ")
+        self._step_nb.add(step7, text=" 7 ДЭБ ")
 
         self._build_step0(step0)
         self._build_step1(step1)
@@ -800,6 +1019,7 @@ class UstavkiFoldersApp(_BASE_CLASS):
         self._build_step4(step4)
         self._build_step5(step5)
         self._build_step6(step6)
+        self._build_step7(step7)
 
         # Нижняя панель
         bot = ttk.Frame(root)
@@ -1568,6 +1788,120 @@ class UstavkiFoldersApp(_BASE_CLASS):
         ok, result_msg = update_visio_map(visio_path, old_path, new_path, '')
         self._log('6', f"  {'OK' if ok else 'ERR'}  {result_msg}")
         self._save_current_session()
+
+    # ── Шаг 7: ДЭБ ───────────────────────────────────────────────────────
+
+    def _build_step7(self, parent):
+        parent.columnconfigure(0, weight=1)
+        parent.rowconfigure(2, weight=1)
+
+        # Настройки
+        cfg = ttk.LabelFrame(parent, text="Настройки браузера", padding=6)
+        cfg.grid(row=0, column=0, sticky='ew', pady=(0, 4))
+        cfg.columnconfigure(1, weight=1)
+
+        ttk.Label(cfg, text="yandexdriver.exe:").grid(row=0, column=0, sticky='e', padx=(0, 6))
+        self._deb_driver_var = tk.StringVar()
+        # По умолчанию ищем рядом с exe
+        default_drv = os.path.join(
+            os.path.dirname(sys.executable) if getattr(sys, 'frozen', False)
+            else os.path.dirname(os.path.abspath(__file__)),
+            'yandexdriver.exe'
+        )
+        if os.path.exists(default_drv):
+            self._deb_driver_var.set(default_drv)
+        dr_row = ttk.Frame(cfg); dr_row.grid(row=0, column=1, sticky='ew')
+        dr_row.columnconfigure(0, weight=1)
+        ttk.Entry(dr_row, textvariable=self._deb_driver_var, width=52).grid(row=0, column=0, sticky='ew')
+        ttk.Button(dr_row, text="…",
+                   command=lambda: self._browse_driver_exe(self._deb_driver_var),
+                   width=3).grid(row=0, column=1, padx=(4, 0))
+        ttk.Label(cfg,
+                  text="Скачать yandexdriver: https://yandex.ru/dev/yandexdriver/\n"
+                       "Поместите yandexdriver.exe рядом с exe (или укажите путь выше).",
+                  foreground='gray').grid(row=1, column=0, columnspan=2, sticky='w', pady=(2, 0))
+
+        ttk.Label(parent,
+                  text="Загружает обновлённые карты уставок (Visio + PDF) в ДЭБ через Яндекс Браузер.\n"
+                       "Для каждой записи: берёт dispatch_name → ищет в каталоге ДЭБ → "
+                       "заменяет файлы → сохраняет.\n"
+                       "Требует: selenium, pyautogui, yandexdriver.exe рядом с exe.",
+                  wraplength=720, foreground='gray').grid(row=1, column=0, sticky='w', pady=(0, 4))
+
+        txt = tk.Text(parent, height=12, wrap='word', state='disabled', font=('Consolas', 9))
+        sb = ttk.Scrollbar(parent, orient='vertical', command=txt.yview)
+        txt.configure(yscrollcommand=sb.set)
+        txt.grid(row=2, column=0, sticky='nsew')
+        sb.grid(row=2, column=1, sticky='ns')
+        self._logs['7'] = txt
+
+        bf = ttk.Frame(parent)
+        bf.grid(row=3, column=0, pady=(6, 0), sticky='w')
+        ttk.Button(bf, text="Загрузить в ДЭБ (все записи) →",
+                   command=self._upload_deb_all).pack(side='left', padx=4)
+        ttk.Button(bf, text="Открыть каталог ДЭБ в браузере",
+                   command=self._open_deb_url).pack(side='left', padx=4)
+
+    def _browse_driver_exe(self, var: tk.StringVar):
+        f = filedialog.askopenfilename(
+            title="Выберите yandexdriver.exe / chromedriver.exe",
+            initialdir=os.path.dirname(var.get()) if var.get() else os.path.expanduser('~'),
+            filetypes=[("Exe файлы", "*.exe"), ("Все файлы", "*.*")],
+            parent=self,
+        )
+        if f:
+            var.set(f.replace('/', '\\'))
+
+    def _open_deb_url(self):
+        import webbrowser
+        webbrowser.open(DEB_MAPS_URL)
+
+    def _upload_deb_all(self):
+        if not HAS_SELENIUM:
+            self._log('7', "ОШИБКА: selenium не установлен  →  pip install selenium"); return
+        if not HAS_PYAUTOGUI:
+            self._log('7', "ОШИБКА: pyautogui не установлен  →  pip install pyautogui"); return
+        if not self.ustavki_entries:
+            self._log('7', "Список записей пуст. Добавьте файлы на шаге 0."); return
+
+        driver_path = self._deb_driver_var.get().strip()
+        maps_folder = self._maps_folder_var.get() if hasattr(self, '_maps_folder_var') else MAPS_FOLDER
+        pdf_folder  = self._pdf_folder_var.get()  if hasattr(self, '_pdf_folder_var')  else MAPS_PDF_FOLDER
+
+        objects_info = []
+        for entry in self.ustavki_entries:
+            short = match_object_to_short_name(entry.get('object_name', ''))
+            if not short:
+                continue
+            dispatch = entry.get('dispatch_name', '') or entry.get('object_name', '')
+            visio_path = ''
+            for ext in ('.vsdx', '.vsd'):
+                cand = os.path.join(maps_folder, short + ext)
+                if os.path.exists(cand):
+                    visio_path = cand
+                    break
+            pdf_path = os.path.join(pdf_folder, short + '.pdf')
+            objects_info.append((dispatch, visio_path, pdf_path))
+
+        if not objects_info:
+            self._log('7', "Нет объектов с распознанным коротким именем. "
+                           "Проверьте шаг 1 (парсировать данные).")
+            return
+
+        msg = (f"Загрузить в ДЭБ для {len(objects_info)} объектов?\n\n" +
+               '\n'.join(f"  • {d}" + (f"\n    Visio: {os.path.basename(v)}" if v else "  [Visio не найден]")
+                         for d, v, _ in objects_info[:8]) +
+               (f"\n  ...и ещё {len(objects_info)-8}" if len(objects_info) > 8 else '') +
+               "\n\nОткроется Яндекс Браузер. Продолжить?")
+        if not messagebox.askyesno("Подтверждение", msg, parent=self):
+            return
+
+        self._log('7', f"Начало загрузки {len(objects_info)} объектов...")
+        for dispatch, visio_path, pdf_path in objects_info:
+            self._log('7', f"→ {dispatch}")
+            ok, msg_r = upload_to_deb_entry(dispatch, visio_path, pdf_path, driver_path)
+            self._log('7', f"  {'OK' if ok else 'ERR'}  {msg_r}")
+        self._log('7', "--- Завершено ---")
 
     # ── Сессия ────────────────────────────────────────────────────────────
 
