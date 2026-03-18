@@ -16,7 +16,7 @@ def to_win(linux_path):
     return "Z:\\" + linux_path.lstrip("/").replace("/", "\\")
 
 
-def build_exe(script, name, extra_data=None):
+def build_exe(script, name, extra_data=None, extra_args=None, icon=None):
     dist = to_win(f"{BASE}/dist")
     work = f"Z:\\tmp\\pyi_{name}"
     src  = to_win(f"{BASE}/{script}")
@@ -32,6 +32,14 @@ def build_exe(script, name, extra_data=None):
         "--hidden-import=tkinter.ttk",
         "--collect-all=tkinter",
     ]
+
+    if icon:
+        cmd.append(f"--icon={to_win(icon)}")
+        # Кладём ico в папку icons/ внутри exe, чтобы iconbitmap() нашёл его в _MEIPASS
+        cmd.append(f"--add-data={to_win(icon)}:icons")
+
+    if extra_args:
+        cmd.extend(extra_args)
 
     shared = os.path.join(BASE, "shared_lib.py")
     if os.path.exists(shared):
@@ -66,17 +74,36 @@ def build_exe(script, name, extra_data=None):
     return result.returncode == 0
 
 
+WIN32COM_ARGS = [
+    "--hidden-import=win32com",
+    "--hidden-import=win32com.client",
+    "--hidden-import=win32com.server",
+    "--hidden-import=win32com.shell",
+    "--collect-all=win32com",
+    "--collect-all=win32",
+    "--collect-all=win32comext",
+    "--hidden-import=win32api",
+    "--hidden-import=win32con",
+    "--hidden-import=pywintypes",
+]
+
+
 def main():
+    icons_dir = os.path.join(BASE, "icons")
     programs = [
-        ("1_letter_register.py", "1_LetterRegister"),
-        ("2_ustavki_folders.py", "2_UstavkiFolders"),
-        ("3_ustavki_map.py",     "3_UstavkiMap"),
-        # 4_deb_selenium.py — требует selenium/pywin32, собирается отдельно
+        ("1_letter_register.py", "1_LetterRegister", None, None,
+         os.path.join(icons_dir, "1_letter.ico")),
+        # 2_UstavkiFolders включает шаги 0-6 (Visio), нужны WIN32COM_ARGS
+        ("2_ustavki_folders.py", "2_UstavkiFolders", None, WIN32COM_ARGS,
+         os.path.join(icons_dir, "2_folders.ico")),
     ]
 
     os.makedirs(os.path.join(BASE, "dist"), exist_ok=True)
-    ok = all(build_exe(script, name) for script, name in programs)
-    sys.exit(0 if ok else 1)
+    results = []
+    for script, name, extra_data, extra_args, icon in programs:
+        icon_path = icon if (icon and os.path.exists(icon)) else None
+        results.append(build_exe(script, name, extra_data, extra_args, icon_path))
+    sys.exit(0 if all(results) else 1)
 
 
 if __name__ == "__main__":

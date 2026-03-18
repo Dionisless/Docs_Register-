@@ -30,12 +30,18 @@ import tkinter as tk
 from tkinter import ttk, filedialog, messagebox
 from datetime import datetime
 
+
+def _resource_path(rel: str) -> str:
+    base = getattr(sys, '_MEIPASS', os.path.dirname(os.path.abspath(__file__)))
+    return os.path.join(base, rel)
+
 from shared_lib import (
-    REGISTRY_PATH, SUMMARY_PATH, USTAVKI_EXEC_BASE,
+    REGISTRY_PATH, SUMMARY_PATH, USTAVKI_EXEC_BASE, USTAVKI_ARCHIVE_BASE,
+    USTAVKI_REAL_ARCHIVE_BASE, MAPS_FOLDER, MAPS_PDF_FOLDER,
     OBJECT_SHORT_NAMES, EMPTY_USTAVKI_ENTRY,
     sanitize_for_filename, parse_date, fmt_date_ymd_underscore,
-    match_object_to_short_name, find_object_exec_folder,
-    find_current_and_archive_folders,
+    match_object_to_short_name, get_object_short_name_from_path,
+    find_object_exec_folder, find_current_and_archive_folders,
     load_session, save_session,
 )
 
@@ -65,8 +71,70 @@ except Exception:
 
 # ── Парсинг таблиц .docx ─────────────────────────────────────────────────────
 
+def _parse_table_number_str(table_num: str) -> tuple | None:
+    """
+    Разбирает строку вида 'YY-NNN' или 'ПРДУ-РЗ-YY-NNN'.
+    Возвращает (year_2digit, number) или None.
+    """
+    m = re.search(r'(\d{2})-(\d+)', table_num)
+    if m:
+        return int(m.group(1)), int(m.group(2))
+    return None
+
+
+def _is_old_form_by_number(table_num: str) -> bool:
+    """
+    Старая форма: год (YY) <= 25 И номер (NNN) <= 470.
+    Примеры: 25-450 → старая, 24-1000 → старая, 25-471 → новая, 26-1 → новая.
+    """
+    parsed = _parse_table_number_str(table_num)
+    if parsed is None:
+        return False
+    year, num = parsed
+    return year <= 25 and num <= 470
+
+
+def _extract_table_num_raw(doc_path: str, doc=None) -> str:
+    """
+    Пытается извлечь строку номера таблицы (YY-NNN) из:
+    1) имени файла  (паттерн -YY-NNN( или _YY-NNN_)
+    2) первого абзаца документа (ПРДУ-РЗ-YY-NNN)
+    """
+    fname = os.path.basename(doc_path)
+    m = re.search(r'[-_](\d{2}-\d+)[(\s_]', fname)
+    if m:
+        return m.group(1)
+    # Из абзацев — ПРДУ-РЗ-YY-NNN
+    if doc is None:
+        try:
+            doc = DocxDocument(doc_path)
+        except Exception:
+            return ''
+    for p in doc.paragraphs[:5]:
+        m2 = re.search(r'ПРДУ-РЗ-(\d{2}-\d+)', p.text)
+        if m2:
+            return m2.group(1)
+    return ''
+
+
 def detect_table_form(doc_path: str) -> str:
-    doc = DocxDocument(doc_path)
+    """
+    Определяет форму таблицы уставок.
+    Если удаётся извлечь номер — решение по правилу:
+      старая: год(YY) <= 25 И номер(NNN) <= 470
+      новая: иначе
+    Если номер не найден — структурная эвристика (fallback).
+    """
+    try:
+        doc = DocxDocument(doc_path)
+    except Exception:
+        return 'unknown'
+
+    num_raw = _extract_table_num_raw(doc_path, doc)
+    if num_raw:
+        return 'old' if _is_old_form_by_number(num_raw) else 'new'
+
+    # Fallback: структурная проверка
     if not doc.tables:
         return 'unknown'
     t = doc.tables[0]
@@ -294,22 +362,99 @@ def write_to_summary_old(entry: dict, incoming_letter_num: str,
 # ── Файловые операции ─────────────────────────────────────────────────────────
 
 def _normalize_name(s: str) -> str:
-    return re.sub(r'\s+', ' ', s.lower().replace('ё', 'е')).strip()
+    return re.sub(r'\s+', ' ', s.lower().replace('ё', 'е').replace('-', ' ')).strip()
+
+
+def _get_archive_object_folder(file_path: str) -> str:
+    """
+    Возвращает путь к папке объекта в Таблицы уставок РЗА.
+    Берёт имя объекта из родительской папки обрабатываемого файла.
+    Пример:
+      file_path = ...\\Таблицы для исполнения РЗА\\Волна\\Текущие\\файл.docx
+      → возвращает  ...\\Таблицы уставок РЗА\\Волна
+    """
+    # Имя папки-объекта = папка-дедушка или папка-родитель файла
+    # Ищем ближайшую к файлу папку, имя которой есть в OBJECT_SHORT_NAMES
+    obj_short = get_object_short_name_from_path(file_path)
+    if not obj_short:
+        # Fallback: просто берём родительскую папку
+        obj_short = os.path.basename(os.path.dirname(file_path))
+    if not obj_short:
+        return ''
+    archive_folder = os.path.join(USTAVKI_ARCHIVE_BASE, obj_short)
+    return archive_folder
+
+
+def find_archive_candidates_by_filename(new_filepath: str, top_n: int = 5) -> list:
+    """
+    Вариант А: ищет кандидата на архив по схожести ИМЕНИ ФАЙЛА.
+    Смотрит в папку \\Таблицы уставок РЗА\\Объект\\.
+    Возвращает список (path, name, score).
+    """
+    archive_folder = _get_archive_object_folder(new_filepath)
+    if not archive_folder or not os.path.isdir(archive_folder):
+        return []
+    new_stem = _normalize_name(os.path.splitext(os.path.basename(new_filepath))[0])
+    candidates = []
+    try:
+        for entry in os.scandir(archive_folder):
+            if not entry.is_file():
+                continue
+            stem = _normalize_name(os.path.splitext(entry.name)[0])
+            score = difflib.SequenceMatcher(None, new_stem, stem).ratio()
+            candidates.append((entry.path, entry.name, score))
+    except OSError:
+        pass
+    candidates.sort(key=lambda x: x[2], reverse=True)
+    return candidates[:top_n]
+
+
+def find_archive_candidates_by_dispatch(new_filepath: str, dispatch_name: str,
+                                        top_n: int = 5) -> list:
+    """
+    Вариант Б: ищет кандидата на архив по схожести ДИСПЕТЧЕРСКОГО НАИМЕНОВАНИЯ.
+    Парсирует dispatch_name из каждого файла в \\Таблицы уставок РЗА\\Объект\\
+    и выбирает наиболее похожее на dispatch_name обрабатываемой таблицы.
+    Возвращает список (path, name, score, parsed_dispatch).
+    """
+    if not HAS_DOCX:
+        return []
+    archive_folder = _get_archive_object_folder(new_filepath)
+    if not archive_folder or not os.path.isdir(archive_folder):
+        return []
+    norm_dispatch = _normalize_name(dispatch_name)
+    candidates = []
+    try:
+        for entry in os.scandir(archive_folder):
+            if not entry.is_file() or not entry.name.lower().endswith(('.docx', '.doc')):
+                continue
+            try:
+                parsed = parse_ustavki_table(entry.path)
+                candidate_dispatch = parsed.get('dispatch_name', '') or parsed.get('object_name', '')
+                norm_cd = _normalize_name(candidate_dispatch)
+                score = difflib.SequenceMatcher(None, norm_dispatch, norm_cd).ratio()
+                candidates.append((entry.path, entry.name, score, candidate_dispatch))
+            except Exception:
+                # Если файл нельзя прочитать — пропускаем
+                continue
+    except OSError:
+        pass
+    candidates.sort(key=lambda x: x[2], reverse=True)
+    return candidates[:top_n]
 
 
 def find_archive_candidates(new_filepath: str, current_dir: str, top_n: int = 5) -> list:
+    """Обратная совместимость: поиск по имени файла в указанной папке."""
     if not current_dir or not os.path.isdir(current_dir):
         return []
-    new_stem = os.path.splitext(os.path.basename(new_filepath))[0]
-    new_trimmed = _normalize_name(new_stem[:-5] if len(new_stem) > 5 else new_stem)
+    new_stem = _normalize_name(os.path.splitext(os.path.basename(new_filepath))[0])
     candidates = []
     try:
         for entry in os.scandir(current_dir):
             if not entry.is_file():
                 continue
-            stem = os.path.splitext(entry.name)[0]
-            trimmed = _normalize_name(stem[:-5] if len(stem) > 5 else stem)
-            score = difflib.SequenceMatcher(None, new_trimmed, trimmed).ratio()
+            stem = _normalize_name(os.path.splitext(entry.name)[0])
+            score = difflib.SequenceMatcher(None, new_stem, stem).ratio()
             candidates.append((entry.path, entry.name, score))
     except OSError:
         pass
@@ -318,6 +463,8 @@ def find_archive_candidates(new_filepath: str, current_dir: str, top_n: int = 5)
 
 
 def move_table_files(entry: dict, archive_dir: str, current_dir: str) -> str:
+    os.makedirs(archive_dir, exist_ok=True)
+    os.makedirs(current_dir, exist_ok=True)
     archive_src = entry.get('archive_candidate', '')
     if archive_src and os.path.exists(archive_src):
         dest = os.path.join(archive_dir, os.path.basename(archive_src))
@@ -325,9 +472,134 @@ def move_table_files(entry: dict, archive_dir: str, current_dir: str) -> str:
     src = entry.get('file_path', '')
     if src and os.path.exists(src):
         dest_new = os.path.join(current_dir, os.path.basename(src))
-        shutil.copy2(src, dest_new)
+        shutil.move(src, dest_new)
         return dest_new
     return ''
+
+
+# ── Шаг 5: синие строки и отчёт изменений ────────────────────────────────────
+
+_BLUE_COLORS = {c.lower() for c in [
+    '4472C4','5B9BD5','2E74B5','0070C0','00B0F0','1F3864',
+    '2F5597','1155CC','0000FF','538DD5','4F81BD','44546A',
+]}
+
+
+def _run_has_blue_text(run_element) -> bool:
+    try:
+        from lxml import etree
+    except ImportError:
+        return False
+    run_text = ''.join(t.text or '' for t in run_element.iter()
+                       if t.tag.endswith('}t') or t.tag == 't')
+    if not re.search(r'[a-zA-Zа-яА-ЯёЁ0-9]', run_text):
+        return False
+    xml_str = etree.tostring(run_element).decode('utf-8', errors='ignore').lower()
+    for bc in _BLUE_COLORS:
+        if bc in xml_str:
+            return True
+    return False
+
+
+def extract_blue_rows_from_doc(doc_path: str) -> list:
+    if not HAS_DOCX:
+        return []
+    try:
+        from lxml import etree
+    except ImportError:
+        return []
+    doc = DocxDocument(doc_path)
+    W_R = '{http://schemas.openxmlformats.org/wordprocessingml/2006/main}r'
+    result = []
+    for table in doc.tables:
+        for row in table.rows:
+            has_blue = False
+            for cell in row.cells:
+                for para in cell.paragraphs:
+                    for run_el in para._element.iter(W_R):
+                        if _run_has_blue_text(run_el):
+                            has_blue = True
+                            break
+                    if has_blue:
+                        break
+                if has_blue:
+                    break
+            if has_blue:
+                result.append([c.text.strip() for c in row.cells])
+    return result
+
+
+def generate_changes_report(entries: list, output_path: str):
+    if not HAS_DOCX:
+        raise RuntimeError("python-docx не установлен")
+    doc = DocxDocument()
+    doc.add_heading('Сводка изменений таблиц уставок', level=1)
+    for i, entry in enumerate(entries, 1):
+        doc.add_heading(
+            f"Таблица {i}: {entry.get('dispatch_name','?')} — {entry.get('table_number','?')}",
+            level=2)
+        doc.add_paragraph(
+            f"Объект: {entry.get('object_name','')}\n"
+            f"Исх. письмо: {entry.get('outgoing_letter','')}"
+        )
+        blue_rows = extract_blue_rows_from_doc(entry.get('file_path', ''))
+        if not blue_rows:
+            doc.add_paragraph('Изменений (синий цвет) не обнаружено.')
+            continue
+        num_cols = max(len(r) for r in blue_rows)
+        tbl = doc.add_table(rows=len(blue_rows), cols=num_cols)
+        tbl.style = 'Table Grid'
+        for ri, row_data in enumerate(blue_rows):
+            for ci, cell_text in enumerate(row_data):
+                if ci < num_cols:
+                    tbl.cell(ri, ci).text = cell_text
+    doc.save(output_path)
+    try:
+        os.startfile(output_path)
+    except Exception:
+        pass
+
+
+# ── Шаг 6: Visio ──────────────────────────────────────────────────────────────
+
+def update_visio_map(visio_path: str, old_table_path: str,
+                     new_table_path: str, new_table_number: str) -> tuple:
+    try:
+        import win32com.client as win32
+    except ImportError:
+        return False, "win32com не доступен (нужен pywin32)"
+    if not os.path.exists(visio_path):
+        return False, f"Файл не найден: {visio_path}"
+    visio = None
+    try:
+        visio = win32.Dispatch('Visio.Application')
+        visio.Visible = False
+        doc = visio.Documents.Open(os.path.abspath(visio_path))
+        replaced = 0
+        for page in doc.Pages:
+            for shape in page.Shapes:
+                for i in range(1, shape.Hyperlinks.Count + 1):
+                    hl = shape.Hyperlinks.Item(i)
+                    if old_table_path.lower() in hl.Address.lower():
+                        hl.Address = new_table_path
+                        if new_table_number:
+                            hl.Description = new_table_number
+                        replaced += 1
+        doc.Save()
+        stem = os.path.splitext(os.path.basename(visio_path))[0]
+        pdf_path = os.path.join(MAPS_PDF_FOLDER, stem + '.pdf')
+        os.makedirs(MAPS_PDF_FOLDER, exist_ok=True)
+        doc.ExportAsFixedFormat(1, pdf_path, 0, 0)
+        doc.Close()
+        return True, f"Заменено ссылок: {replaced}, PDF: {pdf_path}"
+    except Exception as exc:
+        return False, str(exc)
+    finally:
+        try:
+            if visio:
+                visio.Quit()
+        except Exception:
+            pass
 
 
 # ── UI: диалог «Строка не найдена» ───────────────────────────────────────────
@@ -406,6 +678,7 @@ class UstavkiFoldersApp(_BASE_CLASS):
         super().__init__()
         self.ustavki_entries: list = []
         self.in_data: dict = {}
+        self._candidates_found: bool = False   # True после нажатия «Найти кандидатов»
 
         # Загрузить сессию
         session = load_session()
@@ -416,6 +689,10 @@ class UstavkiFoldersApp(_BASE_CLASS):
 
         self.title("Таблицы уставок — Раскладка по папкам  v2")
         self.resizable(True, True)
+        try:
+            self.iconbitmap(_resource_path('icons/2_folders.ico'))
+        except Exception:
+            pass
         self._build_ui()
         self._center_window()
 
@@ -461,11 +738,15 @@ class UstavkiFoldersApp(_BASE_CLASS):
         step2 = ttk.Frame(self._step_nb, padding=8)
         step3 = ttk.Frame(self._step_nb, padding=8)
         step4 = ttk.Frame(self._step_nb, padding=8)
+        step5 = ttk.Frame(self._step_nb, padding=8)
+        step6 = ttk.Frame(self._step_nb, padding=8)
         self._step_nb.add(step0, text=" 0 Файлы ")
         self._step_nb.add(step1, text=" 1 Данные ")
         self._step_nb.add(step2, text=" 2 → .docx ")
         self._step_nb.add(step3, text=" 3 Реестры ")
         self._step_nb.add(step4, text=" 4 Раскладка ")
+        self._step_nb.add(step5, text=" 5 Изменения ")
+        self._step_nb.add(step6, text=" 6 Карты Visio ")
 
         self._build_step0(step0)
         self._build_step1(step1)
@@ -481,6 +762,8 @@ class UstavkiFoldersApp(_BASE_CLASS):
             "При неудаче — предложит выбрать строку вручную.",
             "Записать в реестры →", self._write_registries_all)
         self._build_step4(step4)
+        self._build_step5(step5)
+        self._build_step6(step6)
 
         # Нижняя панель
         bot = ttk.Frame(root)
@@ -567,19 +850,20 @@ class UstavkiFoldersApp(_BASE_CLASS):
         parent.columnconfigure(0, weight=1)
         parent.rowconfigure(1, weight=1)
         ttk.Label(parent,
-            text="Ищет похожие файлы в папках «Текущие» объектов и предлагает кандидатов для архивации.\n"
-                 "Двойной клик — выбрать другого кандидата из списка.",
-            wraplength=700, foreground='gray').grid(row=0, column=0, sticky='w', pady=(0,4))
+            text="Ищет кандидата на архив в папке \\\\Prim-fs-serv\\...\\Таблицы уставок РЗА\\Объект\\\n"
+                 "по схожести имени файла. Двойной клик — выбрать другого кандидата из списка.",
+            wraplength=700, foreground='gray').grid(row=0, column=0, sticky='w', pady=(0, 4))
         af = ttk.Frame(parent)
         af.grid(row=1, column=0, sticky='nsew')
         af.columnconfigure(0, weight=1)
         af.rowconfigure(0, weight=1)
-        arc_cols = ('file','short','candidate','score')
+        arc_cols = ('file', 'short', 'candidate', 'score', 'method')
         self._arc_tree = ttk.Treeview(af, columns=arc_cols, show='headings', height=12)
-        self._arc_tree.heading('file',      text='Новый файл');       self._arc_tree.column('file',      width=180)
-        self._arc_tree.heading('short',     text='Объект (папка)');   self._arc_tree.column('short',     width=120)
-        self._arc_tree.heading('candidate', text='Кандидат на архив');self._arc_tree.column('candidate', width=220)
-        self._arc_tree.heading('score',     text='Схожесть');         self._arc_tree.column('score',     width=70)
+        self._arc_tree.heading('file',      text='Новый файл');        self._arc_tree.column('file',      width=180)
+        self._arc_tree.heading('short',     text='Объект (папка)');    self._arc_tree.column('short',     width=110)
+        self._arc_tree.heading('candidate', text='Кандидат на архив'); self._arc_tree.column('candidate', width=220)
+        self._arc_tree.heading('score',     text='Схожесть');          self._arc_tree.column('score',     width=65)
+        self._arc_tree.heading('method',    text='Метод');             self._arc_tree.column('method',    width=50)
         vsb = ttk.Scrollbar(af, orient='vertical',   command=self._arc_tree.yview)
         hsb = ttk.Scrollbar(af, orient='horizontal', command=self._arc_tree.xview)
         self._arc_tree.configure(yscrollcommand=vsb.set, xscrollcommand=hsb.set)
@@ -588,9 +872,11 @@ class UstavkiFoldersApp(_BASE_CLASS):
         hsb.grid(row=1, column=0, sticky='ew')
         self._arc_tree.bind('<Double-1>', self._on_arc_dclick)
         bf = ttk.Frame(parent)
-        bf.grid(row=2, column=0, pady=(6,0), sticky='w')
-        ttk.Button(bf, text="Найти кандидатов", command=self._find_candidates).pack(side='left', padx=4)
-        ttk.Button(bf, text="Разложить файлы",  command=self._move_files).pack(side='left', padx=4)
+        bf.grid(row=2, column=0, pady=(6, 0), sticky='w')
+        ttk.Button(bf, text="Найти кандидатов на архив",
+                   command=self._find_candidates_a).pack(side='left', padx=4)
+        ttk.Button(bf, text="Разложить файлы",
+                   command=self._move_files).pack(side='left', padx=4)
 
     # ── Логирование ───────────────────────────────────────────────────────
 
@@ -855,26 +1141,68 @@ class UstavkiFoldersApp(_BASE_CLASS):
 
     # ── Шаг 4: раскладка ─────────────────────────────────────────────────
 
-    def _find_candidates(self):
+    def _fill_exec_dirs(self, entry: dict):
+        """
+        Заполняет _current_dir/_archive_dir.
+
+        Структура папок:
+          Новый файл:  ...\\Таблицы для исполнения РЗА\\ОБЪЕКТ\\файл.docx
+          Старый файл: ...\\Таблицы уставок РЗА\\ОБЪЕКТ\\файл.docx  (кандидат на архив)
+
+        После операции:
+          Старый → ...\\Архив таблиц РЗА\\ОБЪЕКТ\\        (_archive_dir)
+          Новый  → ...\\Таблицы уставок РЗА\\ОБЪЕКТ\\     (_current_dir)
+        """
+        short = get_object_short_name_from_path(entry['file_path'])
+        if not short:
+            obj = entry.get('object_name', '')
+            short = match_object_to_short_name(obj) if obj else ''
+        if not short:
+            short = os.path.basename(os.path.dirname(entry['file_path']))
+        entry['short_name'] = short
+
+        if short:
+            current_dir = os.path.join(USTAVKI_ARCHIVE_BASE, short)       # Таблицы уставок РЗА\ОБЪЕКТ
+            archive_dir = os.path.join(USTAVKI_REAL_ARCHIVE_BASE, short)   # Архив таблиц РЗА\ОБЪЕКТ
+        else:
+            current_dir = archive_dir = ''
+
+        entry['_current_dir'] = current_dir
+        entry['_archive_dir'] = archive_dir
+        return short
+
+    def _find_candidates_a(self):
+        """Вариант А: кандидат по схожести ИМЕНИ ФАЙЛА в Таблицы уставок РЗА\\Объект."""
+        self._candidates_found = True
         self._arc_tree.delete(*self._arc_tree.get_children())
         for entry in self.ustavki_entries:
-            obj   = entry.get('object_name', '')
-            short = match_object_to_short_name(obj)
-            folder = find_object_exec_folder(short) if short else None
-            current_dir, archive_dir = find_current_and_archive_folders(folder) if folder else (None, None)
-            candidates = find_archive_candidates(entry['file_path'], current_dir or '') if current_dir else []
-
+            short = self._fill_exec_dirs(entry)
+            candidates = find_archive_candidates_by_filename(entry['file_path'])
             top = candidates[0] if candidates else ('', '', 0.0)
-            entry['archive_candidate']  = top[0]
-            entry['short_name']         = short
-            entry['_current_dir']       = current_dir or ''
-            entry['_archive_dir']       = archive_dir or ''
-
+            entry['archive_candidate'] = top[0]
             self._arc_tree.insert('', 'end', values=(
                 os.path.basename(entry['file_path']),
                 short,
                 top[1] if top else '',
                 f"{top[2]:.2f}" if len(top) > 2 else '',
+                'А',
+            ))
+
+    def _find_candidates_b(self):
+        """Вариант Б: кандидат по схожести ДИСПЕТЧЕРСКОГО НАИМЕНОВАНИЯ."""
+        self._arc_tree.delete(*self._arc_tree.get_children())
+        for entry in self.ustavki_entries:
+            short = self._fill_exec_dirs(entry)
+            dispatch = entry.get('dispatch_name', '') or entry.get('object_name', '')
+            candidates = find_archive_candidates_by_dispatch(entry['file_path'], dispatch)
+            top = candidates[0] if candidates else ('', '', 0.0, '')
+            entry['archive_candidate'] = top[0]
+            self._arc_tree.insert('', 'end', values=(
+                os.path.basename(entry['file_path']),
+                short,
+                top[1] if top else '',
+                f"{top[2]:.2f}" if len(top) > 2 else '',
+                'Б',
             ))
 
     def _on_arc_dclick(self, event):
@@ -890,25 +1218,42 @@ class UstavkiFoldersApp(_BASE_CLASS):
         if idx >= len(self.ustavki_entries):
             return
         entry = self.ustavki_entries[idx]
-        current_dir = entry.get('_current_dir', '')
-        if not current_dir:
-            return
-        candidates = find_archive_candidates(entry['file_path'], current_dir, top_n=10)
-        if not candidates:
+
+        # Собираем кандидатов из обоих источников
+        cands_a = find_archive_candidates_by_filename(entry['file_path'], top_n=10)
+        dispatch = entry.get('dispatch_name', '') or entry.get('object_name', '')
+        cands_b = find_archive_candidates_by_dispatch(entry['file_path'], dispatch, top_n=10) if HAS_DOCX else []
+
+        # Объединяем: (path, name, score, method)
+        seen = set()
+        all_cands = []
+        for path, name, score in cands_a:
+            if path not in seen:
+                seen.add(path)
+                all_cands.append((path, name, score, 'А'))
+        for path, name, score, _ in cands_b:
+            if path not in seen:
+                seen.add(path)
+                all_cands.append((path, name, score, 'Б'))
+        all_cands.sort(key=lambda x: x[2], reverse=True)
+
+        if not all_cands:
             messagebox.showinfo("Кандидаты", "Похожих файлов не найдено.", parent=self)
             return
+
         dlg = tk.Toplevel(self)
         dlg.title("Выбор архивной таблицы")
         dlg.grab_set()
         ttk.Label(dlg,
                   text=f"Кандидаты для:\n{os.path.basename(entry['file_path'])}",
-                  wraplength=460, font=('','10','bold')).pack(padx=12, pady=(10,4))
-        cols2 = ('name', 'score')
-        tv = ttk.Treeview(dlg, columns=cols2, show='headings', height=8)
-        tv.heading('name', text='Имя файла');  tv.column('name', width=340)
-        tv.heading('score', text='Схожесть'); tv.column('score', width=70)
-        for cpath, cname, cscore in candidates:
-            tv.insert('', 'end', iid=cpath, values=(cname, f"{cscore:.2f}"))
+                  wraplength=460, font=('', '10', 'bold')).pack(padx=12, pady=(10, 4))
+        cols2 = ('name', 'score', 'method')
+        tv = ttk.Treeview(dlg, columns=cols2, show='headings', height=10)
+        tv.heading('name',   text='Имя файла');   tv.column('name',   width=320)
+        tv.heading('score',  text='Схожесть');    tv.column('score',  width=70)
+        tv.heading('method', text='Метод');       tv.column('method', width=50)
+        for cpath, cname, cscore, method in all_cands:
+            tv.insert('', 'end', iid=cpath, values=(cname, f"{cscore:.2f}", method))
         tv.pack(padx=12, fill='both', expand=True)
 
         def _pick():
@@ -925,23 +1270,31 @@ class UstavkiFoldersApp(_BASE_CLASS):
         dlg.wait_window()
 
     def _move_files(self):
-        # Подтверждение с показом что куда
+        # Проверка: была ли нажата кнопка «Найти кандидатов»
+        if not self._candidates_found:
+            messagebox.showwarning("Нет данных",
+                "Сначала нажмите «Найти кандидатов на архив».", parent=self)
+            return
+
+        if not self.ustavki_entries:
+            messagebox.showwarning("Нет файлов",
+                "Список записей пуст. Добавьте файлы на шаге 0.", parent=self)
+            return
+
+        # Строим список операций для подтверждения
         lines = []
         for entry in self.ustavki_entries:
-            cd = entry.get('_current_dir', '')
-            ad = entry.get('_archive_dir', '')
-            if not cd or not ad:
-                continue
+            cd  = entry.get('_current_dir', '')
+            ad  = entry.get('_archive_dir', '')
             arc = entry.get('archive_candidate', '')
-            lines.append(
-                f"  {os.path.basename(entry['file_path'])}\n"
-                f"    → Текущие: {cd}\n"
-                + (f"    архивировать: {os.path.basename(arc)}\n    → Архив: {ad}\n" if arc else '')
-            )
-        if not lines:
-            messagebox.showwarning("Нет данных",
-                "Сначала нажмите «Найти кандидатов».", parent=self)
-            return
+            fn  = os.path.basename(entry['file_path'])
+            if cd and ad:
+                lines.append(
+                    f"  {fn}\n    → Текущие: {cd}\n"
+                    + (f"    архивировать: {os.path.basename(arc)}\n    → Архив: {ad}\n" if arc else '')
+                )
+            else:
+                lines.append(f"  {fn}  [папки объекта не найдены — будет пропущено]")
         msg = "Разложить файлы?\n\n" + '\n'.join(lines[:10])
         if len(lines) > 10:
             msg += f"\n...и ещё {len(lines)-10} файл(ов)"
@@ -967,6 +1320,216 @@ class UstavkiFoldersApp(_BASE_CLASS):
         self._refresh_tree()
         messagebox.showinfo("Раскладка завершена",
             f"Разложено: {moved}  Ошибок: {errors}", parent=self)
+        self._save_current_session()
+
+    # ── Шаг 5: изменения (синие строки) ──────────────────────────────────
+
+    def _build_step5(self, parent):
+        parent.columnconfigure(0, weight=1)
+        parent.rowconfigure(1, weight=1)
+        ttk.Label(parent,
+            text="Ищет строки синего цвета (изменения) во всех таблицах .docx "
+                 "и формирует сводный отчёт Word.\n"
+                 "Файлы берутся из текущего списка (поле file_path каждой записи).",
+            wraplength=700, foreground='gray').grid(row=0, column=0, sticky='w', pady=(0, 6))
+        txt = tk.Text(parent, height=14, wrap='word', state='disabled', font=('Consolas', 9))
+        sb = ttk.Scrollbar(parent, orient='vertical', command=txt.yview)
+        txt.configure(yscrollcommand=sb.set)
+        txt.grid(row=1, column=0, sticky='nsew')
+        sb.grid(row=1, column=1, sticky='ns')
+        self._logs['5'] = txt
+        bf = ttk.Frame(parent)
+        bf.grid(row=2, column=0, pady=(6, 0), sticky='w')
+        ttk.Button(bf, text="Создать отчёт изменений →",
+                   command=self._create_changes_report).pack(side='left', padx=4)
+
+    def _create_changes_report(self):
+        if not HAS_DOCX:
+            self._log('5', "ОШИБКА: python-docx не установлен"); return
+        if not self.ustavki_entries:
+            self._log('5', "Список записей пуст. Добавьте файлы на шаге 0."); return
+        default_name = f"Изменения_{datetime.now().strftime('%Y%m%d_%H%M%S')}.docx"
+        out_path = filedialog.asksaveasfilename(
+            title="Сохранить отчёт изменений",
+            initialdir=os.path.expanduser('~'),
+            initialfile=default_name,
+            defaultextension='.docx',
+            filetypes=[("Word файлы", "*.docx"), ("Все файлы", "*.*")],
+            parent=self,
+        )
+        if not out_path:
+            return
+        msg = (f"Создать отчёт изменений для {len(self.ustavki_entries)} таблиц?\n\n"
+               f"Сохранить как:\n{out_path}\n\nПродолжить?")
+        if not messagebox.askyesno("Подтверждение", msg, parent=self):
+            return
+        self._log('5', f"Анализ {len(self.ustavki_entries)} файлов...")
+        try:
+            generate_changes_report(self.ustavki_entries, out_path)
+            self._log('5', f"Отчёт создан: {out_path}")
+        except Exception as exc:
+            self._log('5', f"ОШИБКА: {exc}")
+
+    # ── Шаг 6: карты Visio ───────────────────────────────────────────────
+
+    def _build_step6(self, parent):
+        parent.columnconfigure(0, weight=1)
+        parent.rowconfigure(2, weight=1)
+
+        cfg = ttk.LabelFrame(parent, text="Пути к папкам", padding=6)
+        cfg.grid(row=0, column=0, sticky='ew', pady=(0, 4))
+        cfg.columnconfigure(1, weight=1)
+        ttk.Label(cfg, text="Папка карт Visio:").grid(row=0, column=0, sticky='e', padx=(0, 6))
+        self._maps_folder_var = tk.StringVar(value=MAPS_FOLDER)
+        ttk.Entry(cfg, textvariable=self._maps_folder_var, width=50).grid(row=0, column=1, sticky='ew')
+        ttk.Button(cfg, text="…", command=lambda: self._browse_folder(self._maps_folder_var),
+                   width=3).grid(row=0, column=2)
+        ttk.Label(cfg, text="Папка PDF:").grid(row=1, column=0, sticky='e', padx=(0, 6))
+        self._pdf_folder_var = tk.StringVar(value=MAPS_PDF_FOLDER)
+        ttk.Entry(cfg, textvariable=self._pdf_folder_var, width=50).grid(row=1, column=1, sticky='ew')
+        ttk.Button(cfg, text="…", command=lambda: self._browse_folder(self._pdf_folder_var),
+                   width=3).grid(row=1, column=2)
+
+        inp = ttk.LabelFrame(parent,
+            text="Ручной ввод (заполняется автоматически из сессии или вручную)", padding=6)
+        inp.grid(row=1, column=0, sticky='ew', pady=(0, 4))
+        inp.columnconfigure(1, weight=1)
+        ttk.Label(inp, text="Старый файл таблицы\n(гиперссылка для замены):",
+                  justify='right').grid(row=0, column=0, sticky='e', padx=(0, 6), pady=3)
+        self._old_table_path_var = tk.StringVar()
+        old_row = ttk.Frame(inp); old_row.grid(row=0, column=1, sticky='ew', pady=3)
+        old_row.columnconfigure(0, weight=1)
+        ttk.Entry(old_row, textvariable=self._old_table_path_var, width=52).grid(row=0, column=0, sticky='ew')
+        ttk.Button(old_row, text="…", command=lambda: self._browse_file(self._old_table_path_var),
+                   width=3).grid(row=0, column=1, padx=(4, 0))
+        ttk.Label(inp, text="Новый файл таблицы\n(будет вставлен как ссылка):",
+                  justify='right').grid(row=1, column=0, sticky='e', padx=(0, 6), pady=3)
+        self._new_table_path_var = tk.StringVar()
+        new_row = ttk.Frame(inp); new_row.grid(row=1, column=1, sticky='ew', pady=3)
+        new_row.columnconfigure(0, weight=1)
+        ttk.Entry(new_row, textvariable=self._new_table_path_var, width=52).grid(row=0, column=0, sticky='ew')
+        ttk.Button(new_row, text="…", command=lambda: self._browse_file(self._new_table_path_var),
+                   width=3).grid(row=0, column=1, padx=(4, 0))
+        ttk.Label(inp, text="(при наличии сессии — новый путь берётся из current_path каждой записи)",
+                  foreground='gray').grid(row=2, column=0, columnspan=2, sticky='w', pady=(0, 2))
+        ttk.Label(inp, text="Объект (краткое имя\n= имя папки):").grid(
+            row=3, column=0, sticky='e', padx=(0, 6), pady=3)
+        obj_row = ttk.Frame(inp); obj_row.grid(row=3, column=1, sticky='ew', pady=3)
+        obj_row.columnconfigure(0, weight=1)
+        self._manual_object_var = tk.StringVar()
+        ttk.Entry(obj_row, textvariable=self._manual_object_var, width=30).grid(row=0, column=0, sticky='w')
+        ttk.Button(obj_row, text="Определить из пути нового файла",
+                   command=self._auto_detect_object).grid(row=0, column=1, padx=(8, 0))
+
+        ttk.Label(parent,
+            text="Для каждой таблицы из списка:\n"
+                 "  • Находит .vsdx файл по краткому имени объекта\n"
+                 "  • Заменяет гиперссылку (старый → новый путь к .docx)\n"
+                 "  • Сохраняет .vsdx и экспортирует PDF\n"
+                 "ТРЕБУЕТ: Microsoft Visio и pywin32",
+            wraplength=700, foreground='gray').grid(row=2, column=0, sticky='w', pady=(0, 4))
+        txt = tk.Text(parent, height=10, wrap='word', state='disabled', font=('Consolas', 9))
+        sb = ttk.Scrollbar(parent, orient='vertical', command=txt.yview)
+        txt.configure(yscrollcommand=sb.set)
+        txt.grid(row=3, column=0, sticky='nsew')
+        sb.grid(row=3, column=1, sticky='ns')
+        self._logs['6'] = txt
+        bf = ttk.Frame(parent)
+        bf.grid(row=4, column=0, pady=(6, 0), sticky='w')
+        ttk.Button(bf, text="Обновить карты Visio (из сессии) →",
+                   command=self._update_maps_all).pack(side='left', padx=4)
+        ttk.Button(bf, text="Обновить карту для одного объекта →",
+                   command=self._update_single_map).pack(side='left', padx=4)
+
+    def _browse_folder(self, var: tk.StringVar):
+        d = filedialog.askdirectory(initialdir=var.get() or os.path.expanduser('~'), parent=self)
+        if d:
+            var.set(d)
+
+    def _browse_file(self, var: tk.StringVar):
+        initial = os.path.dirname(var.get()) if var.get() else os.path.expanduser('~')
+        f = filedialog.askopenfilename(
+            initialdir=initial,
+            filetypes=[("Word файлы", "*.docx *.doc"), ("Все файлы", "*.*")],
+            parent=self,
+        )
+        if f:
+            var.set(f.replace('/', '\\'))
+
+    def _auto_detect_object(self):
+        new_path = self._new_table_path_var.get().strip()
+        if not new_path:
+            messagebox.showwarning("Нет пути", "Сначала выберите новый файл таблицы.", parent=self)
+            return
+        short = get_object_short_name_from_path(new_path)
+        if short:
+            self._manual_object_var.set(short)
+        else:
+            short = os.path.basename(os.path.dirname(new_path))
+            self._manual_object_var.set(short)
+            messagebox.showinfo("Объект",
+                f"Объект не найден в справочнике.\nУстановлено: {short}", parent=self)
+
+    def _update_maps_all(self):
+        maps_folder = self._maps_folder_var.get()
+        if not self.ustavki_entries:
+            self._log('6', "Список записей пуст. Добавьте файлы на шаге 0."); return
+        objects_to_update = [
+            match_object_to_short_name(e.get('object_name', ''))
+            for e in self.ustavki_entries
+            if match_object_to_short_name(e.get('object_name', ''))
+        ]
+        msg = (f"Обновить карты Visio для {len(objects_to_update)} объектов?\n\n"
+               f"Папка карт: {maps_folder}\n\n"
+               + '\n'.join(f"  • {o}" for o in objects_to_update[:10])
+               + (f"\n  ...и ещё {len(objects_to_update)-10}" if len(objects_to_update) > 10 else '')
+               + "\n\nЭто откроет Microsoft Visio для каждого объекта!\nПродолжить?")
+        if not messagebox.askyesno("Подтверждение", msg, parent=self):
+            return
+        for entry in self.ustavki_entries:
+            short = match_object_to_short_name(entry.get('object_name', ''))
+            if not short:
+                self._log('6', f"Объект не распознан: {entry.get('object_name','')}"); continue
+            visio_path = os.path.join(maps_folder, short + '.vsdx')
+            if not os.path.exists(visio_path):
+                visio_path = os.path.join(maps_folder, short + '.vsd')
+            if not os.path.exists(visio_path):
+                self._log('6', f"Visio не найден: {short}.vsdx / .vsd"); continue
+            old_path  = entry.get('archive_candidate', '')
+            new_path  = entry.get('current_path', entry.get('file_path', ''))
+            table_num = entry.get('table_number', '')
+            self._log('6', f"Обновляю: {short}  {os.path.basename(visio_path)}")
+            ok, msg_r = update_visio_map(visio_path, old_path, new_path, table_num)
+            self._log('6', f"  {'OK' if ok else 'ERR'}  {msg_r}")
+        self._save_current_session()
+        self._log('6', "--- Завершено ---")
+
+    def _update_single_map(self):
+        old_path = self._old_table_path_var.get().strip()
+        new_path = self._new_table_path_var.get().strip()
+        short    = self._manual_object_var.get().strip()
+        if not new_path:
+            messagebox.showwarning("Нет данных", "Укажите новый файл таблицы.", parent=self); return
+        if not short:
+            messagebox.showwarning("Нет данных",
+                "Укажите краткое имя объекта (или нажмите «Определить»).", parent=self); return
+        maps_folder = self._maps_folder_var.get()
+        visio_path = os.path.join(maps_folder, short + '.vsdx')
+        if not os.path.exists(visio_path):
+            visio_path = os.path.join(maps_folder, short + '.vsd')
+        if not os.path.exists(visio_path):
+            self._log('6', f"Visio не найден: {short}.vsdx / .vsd в {maps_folder}"); return
+        msg = (f"Обновить карту?\n\n"
+               f"  Объект:  {short}\n"
+               f"  Visio:   {os.path.basename(visio_path)}\n"
+               f"  Старый:  {os.path.basename(old_path) if old_path else '(не указан)'}\n"
+               f"  Новый:   {os.path.basename(new_path)}\n\n"
+               f"Откроется Microsoft Visio. Продолжить?")
+        if not messagebox.askyesno("Подтверждение", msg, parent=self):
+            return
+        self._log('6', f"Обновляю: {short}  {os.path.basename(visio_path)}")
+        ok, result_msg = update_visio_map(visio_path, old_path, new_path, '')
+        self._log('6', f"  {'OK' if ok else 'ERR'}  {result_msg}")
         self._save_current_session()
 
     # ── Сессия ────────────────────────────────────────────────────────────
