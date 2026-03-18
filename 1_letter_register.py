@@ -64,12 +64,15 @@ LETTER_FILETYPES = [
 
 # ── Настройки ─────────────────────────────────────────────────────────────────
 
-def _app_dir() -> str:
-    if getattr(sys, 'frozen', False):
-        return os.path.dirname(sys.executable)
-    return os.path.dirname(os.path.abspath(__file__))
+def _appdata_dir() -> str:
+    """Возвращает %APPDATA%\\DocsRegister, создаёт если нет."""
+    appdata = os.environ.get('APPDATA') or os.path.join(
+        os.environ.get('USERPROFILE', ''), 'AppData', 'Roaming')
+    d = os.path.join(appdata, 'DocsRegister')
+    os.makedirs(d, exist_ok=True)
+    return d
 
-SETTINGS_FILE = os.path.join(_app_dir(), 'letter_settings.json')
+SETTINGS_FILE = os.path.join(_appdata_dir(), 'letter_settings.json')
 
 _settings: dict = {
     'org_abbreviations': {},
@@ -237,20 +240,42 @@ def abbreviate_org(org: str) -> str:
     return abbrs.get(org_stripped, org_stripped)
 
 def build_default_filename_in(date_str: str, incoming_num: str, letter_num: str,
-                               subject: str = '') -> str:
+                               subject: str = '', correspondent: str = '') -> str:
     inner = f"{incoming_num}_{sanitize_for_filename(letter_num)}_{fmt_date_dmy_underscore(date_str)}"
     subject_clean = sanitize_for_filename(subject.strip()) if subject.strip() else ''
-    if subject_clean:
-        return f"{fmt_date_ymd(date_str)} от {subject_clean} ({inner})"
+    # Вставляем сокращённое название перед темой (если оно отличается от полного)
+    abbr = ''
+    if correspondent:
+        a = abbreviate_org(correspondent)
+        if a != correspondent.strip():
+            abbr = sanitize_for_filename(a)
+    after_from_parts = [p for p in [abbr, subject_clean] if p]
+    after_from = ' '.join(after_from_parts)
+    if after_from:
+        return f"{fmt_date_ymd(date_str)} от {after_from} ({inner})"
     return f"{fmt_date_ymd(date_str)} ({inner})"
 
-def build_default_filename_out(date_str: str, letter_num: str) -> str:
-    return f"{fmt_date_ymd(date_str)} {sanitize_for_filename(letter_num)}_{fmt_date_dmy_underscore(date_str)}"
+def build_default_filename_out(date_str: str, letter_num: str,
+                               companies_str: str = '', subject: str = '') -> str:
+    inner = f"{sanitize_for_filename(letter_num)}_{fmt_date_dmy_underscore(date_str)}"
+    companies = [abbreviate_org(c.strip()) for c in companies_str.split(';') if c.strip()]
+    company_part = ', '.join(sanitize_for_filename(c) for c in companies if c)
+    subject_clean = sanitize_for_filename(subject.strip()) if subject.strip() else ''
+    middle_parts = [p for p in [company_part, subject_clean] if p]
+    if middle_parts:
+        return f"{fmt_date_ymd(date_str)} в {' '.join(middle_parts)} ({inner})"
+    return f"{fmt_date_ymd(date_str)} ({inner})"
 
 def build_recipient_string(names_str: str, companies_str: str) -> str:
-    names     = [abbreviate_fio(n.strip()) for n in names_str.split(';') if n.strip()]
-    companies = [abbreviate_org(c.strip()) for c in companies_str.split(';') if c.strip()]
-    parts = [f"{i}. {n} {c}" for i, (n, c) in enumerate(zip(names, companies), 1)]
+    names        = [abbreviate_fio(n.strip()) for n in names_str.split(';') if n.strip()]
+    companies_raw = [c.strip() for c in companies_str.split(';') if c.strip()]
+    companies_abbr = [abbreviate_org(c) for c in companies_raw]
+    parts = []
+    for i, (n, c_raw, c_abbr) in enumerate(zip(names, companies_raw, companies_abbr), 1):
+        if c_abbr != c_raw:   # есть сокращённое название
+            parts.append(f"{c_abbr} - {n}")
+        else:
+            parts.append(f"{i}. {n} {c_abbr}")
     return ';\n'.join(parts) if parts else names_str
 
 def calc_folder_num(full_path: str) -> str:
@@ -574,20 +599,28 @@ class RegistrationApp(tk.Tk):
         d = self.in_data
         for key, var in self._in_preview_vars.items():
             var.set(d.get(key, ''))
+        correspondent = d.get('correspondent', '')
         self._default_filename_in = build_default_filename_in(
             d.get('date',''), d.get('incoming_num',''), d.get('letter_num',''),
-            d.get('subject',''))
+            d.get('subject',''), correspondent)
         self.in_filename_var.set(self._default_filename_in)
         self.in_keywords_var.set(d.get('subject', ''))
         self.in_save_path_var.set('')
         self.in_folder_num_var.set('')
+        # Автор: если есть сокращение — «Сокращение-», иначе «-»
+        abbr = abbreviate_org(correspondent) if correspondent else ''
+        if abbr and abbr != correspondent.strip():
+            self.in_author_var.set(f"{abbr}-")
+        else:
+            self.in_author_var.set('-')
 
     def _apply_outgoing_data(self):
         d = self.out_data
         for key, var in self._out_preview_vars.items():
             var.set(d.get(key, ''))
         self._default_filename_out = build_default_filename_out(
-            d.get('date',''), d.get('letter_num',''))
+            d.get('date',''), d.get('letter_num',''),
+            d.get('recipient_companies',''), d.get('subject',''))
         self.out_filename_var.set(self._default_filename_out)
         self.out_keywords_var.set(d.get('subject',''))
         self.out_save_path_var.set('')

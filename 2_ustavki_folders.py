@@ -32,6 +32,7 @@ from datetime import datetime
 
 from shared_lib import (
     REGISTRY_PATH, SUMMARY_PATH, USTAVKI_EXEC_BASE, USTAVKI_ARCHIVE_BASE,
+    USTAVKI_REAL_ARCHIVE_BASE,
     OBJECT_SHORT_NAMES, EMPTY_USTAVKI_ENTRY,
     sanitize_for_filename, parse_date, fmt_date_ymd_underscore,
     match_object_to_short_name, get_object_short_name_from_path,
@@ -457,6 +458,8 @@ def find_archive_candidates(new_filepath: str, current_dir: str, top_n: int = 5)
 
 
 def move_table_files(entry: dict, archive_dir: str, current_dir: str) -> str:
+    os.makedirs(archive_dir, exist_ok=True)
+    os.makedirs(current_dir, exist_ok=True)
     archive_src = entry.get('archive_candidate', '')
     if archive_src and os.path.exists(archive_src):
         dest = os.path.join(archive_dir, os.path.basename(archive_src))
@@ -464,7 +467,7 @@ def move_table_files(entry: dict, archive_dir: str, current_dir: str) -> str:
     src = entry.get('file_path', '')
     if src and os.path.exists(src):
         dest_new = os.path.join(current_dir, os.path.basename(src))
-        shutil.copy2(src, dest_new)
+        shutil.move(src, dest_new)
         return dest_new
     return ''
 
@@ -1002,36 +1005,30 @@ class UstavkiFoldersApp(_BASE_CLASS):
         """
         Заполняет _current_dir/_archive_dir.
 
-        Стратегия:
-        1. Определить краткое имя объекта (из пути файла → из object_name → имя родит. папки)
-        2. Найти папку объекта в USTAVKI_EXEC_BASE
-        3. Если не найдена — fallback: ищем «Текущие»/«Архив» прямо в родительской папке файла
+        Структура папок:
+          Новый файл:  ...\\Таблицы для исполнения РЗА\\ОБЪЕКТ\\файл.docx
+          Старый файл: ...\\Таблицы уставок РЗА\\ОБЪЕКТ\\файл.docx  (кандидат на архив)
+
+        После операции:
+          Старый → ...\\Архив таблиц РЗА\\ОБЪЕКТ\\        (_archive_dir)
+          Новый  → ...\\Таблицы уставок РЗА\\ОБЪЕКТ\\     (_current_dir)
         """
         short = get_object_short_name_from_path(entry['file_path'])
         if not short:
             obj = entry.get('object_name', '')
             short = match_object_to_short_name(obj) if obj else ''
         if not short:
-            # Fallback: имя родительской папки файла
             short = os.path.basename(os.path.dirname(entry['file_path']))
         entry['short_name'] = short
 
-        folder = find_object_exec_folder(short) if short else None
+        if short:
+            current_dir = os.path.join(USTAVKI_ARCHIVE_BASE, short)       # Таблицы уставок РЗА\ОБЪЕКТ
+            archive_dir = os.path.join(USTAVKI_REAL_ARCHIVE_BASE, short)   # Архив таблиц РЗА\ОБЪЕКТ
+        else:
+            current_dir = archive_dir = ''
 
-        # Fallback: если объект не найден в USTAVKI_EXEC_BASE —
-        # ищем Текущие/Архив в родительской папке самого файла
-        if not folder:
-            parent = os.path.dirname(entry['file_path'])
-            # Если файл уже лежит в «Текущие» — берём её родителя как папку объекта
-            parent_name = os.path.basename(parent).lower()
-            if 'текущ' in parent_name or 'архив' in parent_name:
-                folder = os.path.dirname(parent)
-            else:
-                folder = parent
-
-        current_dir, archive_dir = find_current_and_archive_folders(folder) if folder else (None, None)
-        entry['_current_dir'] = current_dir or ''
-        entry['_archive_dir'] = archive_dir or ''
+        entry['_current_dir'] = current_dir
+        entry['_archive_dir'] = archive_dir
         return short
 
     def _find_candidates_a(self):
