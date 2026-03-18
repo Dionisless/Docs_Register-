@@ -93,10 +93,9 @@ def main():
     programs = [
         ("1_letter_register.py", "1_LetterRegister", None, None,
          os.path.join(icons_dir, "1_letter.ico")),
-        ("2_ustavki_folders.py", "2_UstavkiFolders", None, None,
+        # 2_UstavkiFolders включает шаги 0-6 (Visio), нужны WIN32COM_ARGS
+        ("2_ustavki_folders.py", "2_UstavkiFolders", None, WIN32COM_ARGS,
          os.path.join(icons_dir, "2_folders.ico")),
-        ("3_ustavki_map.py",     "3_UstavkiMap",     None, WIN32COM_ARGS,
-         os.path.join(icons_dir, "3_map.ico")),
     ]
 
     os.makedirs(os.path.join(BASE, "dist"), exist_ok=True)

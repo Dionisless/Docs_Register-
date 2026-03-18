@@ -37,7 +37,7 @@ def _resource_path(rel: str) -> str:
 
 from shared_lib import (
     REGISTRY_PATH, SUMMARY_PATH, USTAVKI_EXEC_BASE, USTAVKI_ARCHIVE_BASE,
-    USTAVKI_REAL_ARCHIVE_BASE,
+    USTAVKI_REAL_ARCHIVE_BASE, MAPS_FOLDER, MAPS_PDF_FOLDER,
     OBJECT_SHORT_NAMES, EMPTY_USTAVKI_ENTRY,
     sanitize_for_filename, parse_date, fmt_date_ymd_underscore,
     match_object_to_short_name, get_object_short_name_from_path,
@@ -477,6 +477,131 @@ def move_table_files(entry: dict, archive_dir: str, current_dir: str) -> str:
     return ''
 
 
+# ── Шаг 5: синие строки и отчёт изменений ────────────────────────────────────
+
+_BLUE_COLORS = {c.lower() for c in [
+    '4472C4','5B9BD5','2E74B5','0070C0','00B0F0','1F3864',
+    '2F5597','1155CC','0000FF','538DD5','4F81BD','44546A',
+]}
+
+
+def _run_has_blue_text(run_element) -> bool:
+    try:
+        from lxml import etree
+    except ImportError:
+        return False
+    run_text = ''.join(t.text or '' for t in run_element.iter()
+                       if t.tag.endswith('}t') or t.tag == 't')
+    if not re.search(r'[a-zA-Zа-яА-ЯёЁ0-9]', run_text):
+        return False
+    xml_str = etree.tostring(run_element).decode('utf-8', errors='ignore').lower()
+    for bc in _BLUE_COLORS:
+        if bc in xml_str:
+            return True
+    return False
+
+
+def extract_blue_rows_from_doc(doc_path: str) -> list:
+    if not HAS_DOCX:
+        return []
+    try:
+        from lxml import etree
+    except ImportError:
+        return []
+    doc = DocxDocument(doc_path)
+    W_R = '{http://schemas.openxmlformats.org/wordprocessingml/2006/main}r'
+    result = []
+    for table in doc.tables:
+        for row in table.rows:
+            has_blue = False
+            for cell in row.cells:
+                for para in cell.paragraphs:
+                    for run_el in para._element.iter(W_R):
+                        if _run_has_blue_text(run_el):
+                            has_blue = True
+                            break
+                    if has_blue:
+                        break
+                if has_blue:
+                    break
+            if has_blue:
+                result.append([c.text.strip() for c in row.cells])
+    return result
+
+
+def generate_changes_report(entries: list, output_path: str):
+    if not HAS_DOCX:
+        raise RuntimeError("python-docx не установлен")
+    doc = DocxDocument()
+    doc.add_heading('Сводка изменений таблиц уставок', level=1)
+    for i, entry in enumerate(entries, 1):
+        doc.add_heading(
+            f"Таблица {i}: {entry.get('dispatch_name','?')} — {entry.get('table_number','?')}",
+            level=2)
+        doc.add_paragraph(
+            f"Объект: {entry.get('object_name','')}\n"
+            f"Исх. письмо: {entry.get('outgoing_letter','')}"
+        )
+        blue_rows = extract_blue_rows_from_doc(entry.get('file_path', ''))
+        if not blue_rows:
+            doc.add_paragraph('Изменений (синий цвет) не обнаружено.')
+            continue
+        num_cols = max(len(r) for r in blue_rows)
+        tbl = doc.add_table(rows=len(blue_rows), cols=num_cols)
+        tbl.style = 'Table Grid'
+        for ri, row_data in enumerate(blue_rows):
+            for ci, cell_text in enumerate(row_data):
+                if ci < num_cols:
+                    tbl.cell(ri, ci).text = cell_text
+    doc.save(output_path)
+    try:
+        os.startfile(output_path)
+    except Exception:
+        pass
+
+
+# ── Шаг 6: Visio ──────────────────────────────────────────────────────────────
+
+def update_visio_map(visio_path: str, old_table_path: str,
+                     new_table_path: str, new_table_number: str) -> tuple:
+    try:
+        import win32com.client as win32
+    except ImportError:
+        return False, "win32com не доступен (нужен pywin32)"
+    if not os.path.exists(visio_path):
+        return False, f"Файл не найден: {visio_path}"
+    visio = None
+    try:
+        visio = win32.Dispatch('Visio.Application')
+        visio.Visible = False
+        doc = visio.Documents.Open(os.path.abspath(visio_path))
+        replaced = 0
+        for page in doc.Pages:
+            for shape in page.Shapes:
+                for i in range(1, shape.Hyperlinks.Count + 1):
+                    hl = shape.Hyperlinks.Item(i)
+                    if old_table_path.lower() in hl.Address.lower():
+                        hl.Address = new_table_path
+                        if new_table_number:
+                            hl.Description = new_table_number
+                        replaced += 1
+        doc.Save()
+        stem = os.path.splitext(os.path.basename(visio_path))[0]
+        pdf_path = os.path.join(MAPS_PDF_FOLDER, stem + '.pdf')
+        os.makedirs(MAPS_PDF_FOLDER, exist_ok=True)
+        doc.ExportAsFixedFormat(1, pdf_path, 0, 0)
+        doc.Close()
+        return True, f"Заменено ссылок: {replaced}, PDF: {pdf_path}"
+    except Exception as exc:
+        return False, str(exc)
+    finally:
+        try:
+            if visio:
+                visio.Quit()
+        except Exception:
+            pass
+
+
 # ── UI: диалог «Строка не найдена» ───────────────────────────────────────────
 
 class _RegistryNotFoundDialog(tk.Toplevel):
@@ -613,11 +738,15 @@ class UstavkiFoldersApp(_BASE_CLASS):
         step2 = ttk.Frame(self._step_nb, padding=8)
         step3 = ttk.Frame(self._step_nb, padding=8)
         step4 = ttk.Frame(self._step_nb, padding=8)
+        step5 = ttk.Frame(self._step_nb, padding=8)
+        step6 = ttk.Frame(self._step_nb, padding=8)
         self._step_nb.add(step0, text=" 0 Файлы ")
         self._step_nb.add(step1, text=" 1 Данные ")
         self._step_nb.add(step2, text=" 2 → .docx ")
         self._step_nb.add(step3, text=" 3 Реестры ")
         self._step_nb.add(step4, text=" 4 Раскладка ")
+        self._step_nb.add(step5, text=" 5 Изменения ")
+        self._step_nb.add(step6, text=" 6 Карты Visio ")
 
         self._build_step0(step0)
         self._build_step1(step1)
@@ -633,6 +762,8 @@ class UstavkiFoldersApp(_BASE_CLASS):
             "При неудаче — предложит выбрать строку вручную.",
             "Записать в реестры →", self._write_registries_all)
         self._build_step4(step4)
+        self._build_step5(step5)
+        self._build_step6(step6)
 
         # Нижняя панель
         bot = ttk.Frame(root)
@@ -1189,6 +1320,216 @@ class UstavkiFoldersApp(_BASE_CLASS):
         self._refresh_tree()
         messagebox.showinfo("Раскладка завершена",
             f"Разложено: {moved}  Ошибок: {errors}", parent=self)
+        self._save_current_session()
+
+    # ── Шаг 5: изменения (синие строки) ──────────────────────────────────
+
+    def _build_step5(self, parent):
+        parent.columnconfigure(0, weight=1)
+        parent.rowconfigure(1, weight=1)
+        ttk.Label(parent,
+            text="Ищет строки синего цвета (изменения) во всех таблицах .docx "
+                 "и формирует сводный отчёт Word.\n"
+                 "Файлы берутся из текущего списка (поле file_path каждой записи).",
+            wraplength=700, foreground='gray').grid(row=0, column=0, sticky='w', pady=(0, 6))
+        txt = tk.Text(parent, height=14, wrap='word', state='disabled', font=('Consolas', 9))
+        sb = ttk.Scrollbar(parent, orient='vertical', command=txt.yview)
+        txt.configure(yscrollcommand=sb.set)
+        txt.grid(row=1, column=0, sticky='nsew')
+        sb.grid(row=1, column=1, sticky='ns')
+        self._logs['5'] = txt
+        bf = ttk.Frame(parent)
+        bf.grid(row=2, column=0, pady=(6, 0), sticky='w')
+        ttk.Button(bf, text="Создать отчёт изменений →",
+                   command=self._create_changes_report).pack(side='left', padx=4)
+
+    def _create_changes_report(self):
+        if not HAS_DOCX:
+            self._log('5', "ОШИБКА: python-docx не установлен"); return
+        if not self.ustavki_entries:
+            self._log('5', "Список записей пуст. Добавьте файлы на шаге 0."); return
+        default_name = f"Изменения_{datetime.now().strftime('%Y%m%d_%H%M%S')}.docx"
+        out_path = filedialog.asksaveasfilename(
+            title="Сохранить отчёт изменений",
+            initialdir=os.path.expanduser('~'),
+            initialfile=default_name,
+            defaultextension='.docx',
+            filetypes=[("Word файлы", "*.docx"), ("Все файлы", "*.*")],
+            parent=self,
+        )
+        if not out_path:
+            return
+        msg = (f"Создать отчёт изменений для {len(self.ustavki_entries)} таблиц?\n\n"
+               f"Сохранить как:\n{out_path}\n\nПродолжить?")
+        if not messagebox.askyesno("Подтверждение", msg, parent=self):
+            return
+        self._log('5', f"Анализ {len(self.ustavki_entries)} файлов...")
+        try:
+            generate_changes_report(self.ustavki_entries, out_path)
+            self._log('5', f"Отчёт создан: {out_path}")
+        except Exception as exc:
+            self._log('5', f"ОШИБКА: {exc}")
+
+    # ── Шаг 6: карты Visio ───────────────────────────────────────────────
+
+    def _build_step6(self, parent):
+        parent.columnconfigure(0, weight=1)
+        parent.rowconfigure(2, weight=1)
+
+        cfg = ttk.LabelFrame(parent, text="Пути к папкам", padding=6)
+        cfg.grid(row=0, column=0, sticky='ew', pady=(0, 4))
+        cfg.columnconfigure(1, weight=1)
+        ttk.Label(cfg, text="Папка карт Visio:").grid(row=0, column=0, sticky='e', padx=(0, 6))
+        self._maps_folder_var = tk.StringVar(value=MAPS_FOLDER)
+        ttk.Entry(cfg, textvariable=self._maps_folder_var, width=50).grid(row=0, column=1, sticky='ew')
+        ttk.Button(cfg, text="…", command=lambda: self._browse_folder(self._maps_folder_var),
+                   width=3).grid(row=0, column=2)
+        ttk.Label(cfg, text="Папка PDF:").grid(row=1, column=0, sticky='e', padx=(0, 6))
+        self._pdf_folder_var = tk.StringVar(value=MAPS_PDF_FOLDER)
+        ttk.Entry(cfg, textvariable=self._pdf_folder_var, width=50).grid(row=1, column=1, sticky='ew')
+        ttk.Button(cfg, text="…", command=lambda: self._browse_folder(self._pdf_folder_var),
+                   width=3).grid(row=1, column=2)
+
+        inp = ttk.LabelFrame(parent,
+            text="Ручной ввод (заполняется автоматически из сессии или вручную)", padding=6)
+        inp.grid(row=1, column=0, sticky='ew', pady=(0, 4))
+        inp.columnconfigure(1, weight=1)
+        ttk.Label(inp, text="Старый файл таблицы\n(гиперссылка для замены):",
+                  justify='right').grid(row=0, column=0, sticky='e', padx=(0, 6), pady=3)
+        self._old_table_path_var = tk.StringVar()
+        old_row = ttk.Frame(inp); old_row.grid(row=0, column=1, sticky='ew', pady=3)
+        old_row.columnconfigure(0, weight=1)
+        ttk.Entry(old_row, textvariable=self._old_table_path_var, width=52).grid(row=0, column=0, sticky='ew')
+        ttk.Button(old_row, text="…", command=lambda: self._browse_file(self._old_table_path_var),
+                   width=3).grid(row=0, column=1, padx=(4, 0))
+        ttk.Label(inp, text="Новый файл таблицы\n(будет вставлен как ссылка):",
+                  justify='right').grid(row=1, column=0, sticky='e', padx=(0, 6), pady=3)
+        self._new_table_path_var = tk.StringVar()
+        new_row = ttk.Frame(inp); new_row.grid(row=1, column=1, sticky='ew', pady=3)
+        new_row.columnconfigure(0, weight=1)
+        ttk.Entry(new_row, textvariable=self._new_table_path_var, width=52).grid(row=0, column=0, sticky='ew')
+        ttk.Button(new_row, text="…", command=lambda: self._browse_file(self._new_table_path_var),
+                   width=3).grid(row=0, column=1, padx=(4, 0))
+        ttk.Label(inp, text="(при наличии сессии — новый путь берётся из current_path каждой записи)",
+                  foreground='gray').grid(row=2, column=0, columnspan=2, sticky='w', pady=(0, 2))
+        ttk.Label(inp, text="Объект (краткое имя\n= имя папки):").grid(
+            row=3, column=0, sticky='e', padx=(0, 6), pady=3)
+        obj_row = ttk.Frame(inp); obj_row.grid(row=3, column=1, sticky='ew', pady=3)
+        obj_row.columnconfigure(0, weight=1)
+        self._manual_object_var = tk.StringVar()
+        ttk.Entry(obj_row, textvariable=self._manual_object_var, width=30).grid(row=0, column=0, sticky='w')
+        ttk.Button(obj_row, text="Определить из пути нового файла",
+                   command=self._auto_detect_object).grid(row=0, column=1, padx=(8, 0))
+
+        ttk.Label(parent,
+            text="Для каждой таблицы из списка:\n"
+                 "  • Находит .vsdx файл по краткому имени объекта\n"
+                 "  • Заменяет гиперссылку (старый → новый путь к .docx)\n"
+                 "  • Сохраняет .vsdx и экспортирует PDF\n"
+                 "ТРЕБУЕТ: Microsoft Visio и pywin32",
+            wraplength=700, foreground='gray').grid(row=2, column=0, sticky='w', pady=(0, 4))
+        txt = tk.Text(parent, height=10, wrap='word', state='disabled', font=('Consolas', 9))
+        sb = ttk.Scrollbar(parent, orient='vertical', command=txt.yview)
+        txt.configure(yscrollcommand=sb.set)
+        txt.grid(row=3, column=0, sticky='nsew')
+        sb.grid(row=3, column=1, sticky='ns')
+        self._logs['6'] = txt
+        bf = ttk.Frame(parent)
+        bf.grid(row=4, column=0, pady=(6, 0), sticky='w')
+        ttk.Button(bf, text="Обновить карты Visio (из сессии) →",
+                   command=self._update_maps_all).pack(side='left', padx=4)
+        ttk.Button(bf, text="Обновить карту для одного объекта →",
+                   command=self._update_single_map).pack(side='left', padx=4)
+
+    def _browse_folder(self, var: tk.StringVar):
+        d = filedialog.askdirectory(initialdir=var.get() or os.path.expanduser('~'), parent=self)
+        if d:
+            var.set(d)
+
+    def _browse_file(self, var: tk.StringVar):
+        initial = os.path.dirname(var.get()) if var.get() else os.path.expanduser('~')
+        f = filedialog.askopenfilename(
+            initialdir=initial,
+            filetypes=[("Word файлы", "*.docx *.doc"), ("Все файлы", "*.*")],
+            parent=self,
+        )
+        if f:
+            var.set(f.replace('/', '\\'))
+
+    def _auto_detect_object(self):
+        new_path = self._new_table_path_var.get().strip()
+        if not new_path:
+            messagebox.showwarning("Нет пути", "Сначала выберите новый файл таблицы.", parent=self)
+            return
+        short = get_object_short_name_from_path(new_path)
+        if short:
+            self._manual_object_var.set(short)
+        else:
+            short = os.path.basename(os.path.dirname(new_path))
+            self._manual_object_var.set(short)
+            messagebox.showinfo("Объект",
+                f"Объект не найден в справочнике.\nУстановлено: {short}", parent=self)
+
+    def _update_maps_all(self):
+        maps_folder = self._maps_folder_var.get()
+        if not self.ustavki_entries:
+            self._log('6', "Список записей пуст. Добавьте файлы на шаге 0."); return
+        objects_to_update = [
+            match_object_to_short_name(e.get('object_name', ''))
+            for e in self.ustavki_entries
+            if match_object_to_short_name(e.get('object_name', ''))
+        ]
+        msg = (f"Обновить карты Visio для {len(objects_to_update)} объектов?\n\n"
+               f"Папка карт: {maps_folder}\n\n"
+               + '\n'.join(f"  • {o}" for o in objects_to_update[:10])
+               + (f"\n  ...и ещё {len(objects_to_update)-10}" if len(objects_to_update) > 10 else '')
+               + "\n\nЭто откроет Microsoft Visio для каждого объекта!\nПродолжить?")
+        if not messagebox.askyesno("Подтверждение", msg, parent=self):
+            return
+        for entry in self.ustavki_entries:
+            short = match_object_to_short_name(entry.get('object_name', ''))
+            if not short:
+                self._log('6', f"Объект не распознан: {entry.get('object_name','')}"); continue
+            visio_path = os.path.join(maps_folder, short + '.vsdx')
+            if not os.path.exists(visio_path):
+                visio_path = os.path.join(maps_folder, short + '.vsd')
+            if not os.path.exists(visio_path):
+                self._log('6', f"Visio не найден: {short}.vsdx / .vsd"); continue
+            old_path  = entry.get('archive_candidate', '')
+            new_path  = entry.get('current_path', entry.get('file_path', ''))
+            table_num = entry.get('table_number', '')
+            self._log('6', f"Обновляю: {short}  {os.path.basename(visio_path)}")
+            ok, msg_r = update_visio_map(visio_path, old_path, new_path, table_num)
+            self._log('6', f"  {'OK' if ok else 'ERR'}  {msg_r}")
+        self._save_current_session()
+        self._log('6', "--- Завершено ---")
+
+    def _update_single_map(self):
+        old_path = self._old_table_path_var.get().strip()
+        new_path = self._new_table_path_var.get().strip()
+        short    = self._manual_object_var.get().strip()
+        if not new_path:
+            messagebox.showwarning("Нет данных", "Укажите новый файл таблицы.", parent=self); return
+        if not short:
+            messagebox.showwarning("Нет данных",
+                "Укажите краткое имя объекта (или нажмите «Определить»).", parent=self); return
+        maps_folder = self._maps_folder_var.get()
+        visio_path = os.path.join(maps_folder, short + '.vsdx')
+        if not os.path.exists(visio_path):
+            visio_path = os.path.join(maps_folder, short + '.vsd')
+        if not os.path.exists(visio_path):
+            self._log('6', f"Visio не найден: {short}.vsdx / .vsd в {maps_folder}"); return
+        msg = (f"Обновить карту?\n\n"
+               f"  Объект:  {short}\n"
+               f"  Visio:   {os.path.basename(visio_path)}\n"
+               f"  Старый:  {os.path.basename(old_path) if old_path else '(не указан)'}\n"
+               f"  Новый:   {os.path.basename(new_path)}\n\n"
+               f"Откроется Microsoft Visio. Продолжить?")
+        if not messagebox.askyesno("Подтверждение", msg, parent=self):
+            return
+        self._log('6', f"Обновляю: {short}  {os.path.basename(visio_path)}")
+        ok, result_msg = update_visio_map(visio_path, old_path, new_path, '')
+        self._log('6', f"  {'OK' if ok else 'ERR'}  {result_msg}")
         self._save_current_session()
 
     # ── Сессия ────────────────────────────────────────────────────────────

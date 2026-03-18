@@ -812,9 +812,6 @@ class RegistrationApp(tk.Tk):
                 'hyperlink_path': hyperlink_path,
             })
             messagebox.showinfo("Готово", "Запись добавлена в журнал!", parent=self)
-            # Сброс пути после регистрации (готов к следующему письму)
-            self.in_save_path_var.set('')
-            self.in_folder_num_var.set('')
         except Exception as exc:
             messagebox.showerror("Ошибка", str(exc), parent=self)
 
@@ -845,8 +842,6 @@ class RegistrationApp(tk.Tk):
                 'hyperlink_path': hyperlink_path,
             })
             messagebox.showinfo("Готово", "Запись добавлена в журнал!", parent=self)
-            self.out_save_path_var.set('')
-            self.out_folder_num_var.set('')
         except Exception as exc:
             messagebox.showerror("Ошибка", str(exc), parent=self)
 
@@ -880,7 +875,8 @@ class RegistrationApp(tk.Tk):
             'incoming_num': d.get('incoming_num', ''),
             'letter_num':   d.get('letter_num', ''),
             'date':         d.get('date', ''),
-            'file_link':    d.get('file_link', ''),
+            # Приоритет: путь сохранённого файла, иначе LanDocs-ссылка
+            'file_link':    self.in_save_path_var.get() or d.get('file_link', ''),
         }}
         try:
             with open(sess_file, 'w', encoding='utf-8') as f:
