@@ -616,14 +616,38 @@ def generate_changes_report(entries: list, output_path: str):
 
 # ── Шаг 6: Visio ──────────────────────────────────────────────────────────────
 
+def _visio_iter_shapes(shapes_coll):
+    """Рекурсивно обходит все фигуры включая sub-shapes внутри групп."""
+    count = 0
+    try:
+        count = shapes_coll.Count
+    except Exception:
+        return
+    for i in range(1, count + 1):
+        try:
+            shp = shapes_coll.Item(i)
+        except Exception:
+            continue
+        yield shp
+        try:
+            if shp.Shapes.Count > 0:
+                yield from _visio_iter_shapes(shp.Shapes)
+        except Exception:
+            pass
+
+
 def update_visio_map(visio_path: str, old_table_path: str,
-                     new_table_path: str, new_table_number: str) -> tuple:
+                     new_table_path: str, new_table_number: str,
+                     pdf_folder: str = '') -> tuple:
     try:
         import win32com.client as win32
     except ImportError:
         return False, "win32com не доступен (нужен pywin32)"
     if not os.path.exists(visio_path):
         return False, f"Файл не найден: {visio_path}"
+    if not new_table_path:
+        return False, "Не указан новый путь к файлу таблицы"
+    old_lower = old_table_path.lower() if old_table_path else ''
     visio = None
     try:
         visio = win32.Dispatch('Visio.Application')
@@ -631,18 +655,30 @@ def update_visio_map(visio_path: str, old_table_path: str,
         doc = visio.Documents.Open(os.path.abspath(visio_path))
         replaced = 0
         for page in doc.Pages:
-            for shape in page.Shapes:
-                for i in range(1, shape.Hyperlinks.Count + 1):
-                    hl = shape.Hyperlinks.Item(i)
-                    if old_table_path.lower() in hl.Address.lower():
-                        hl.Address = new_table_path
-                        if new_table_number:
-                            hl.Description = new_table_number
-                        replaced += 1
+            for shape in _visio_iter_shapes(page.Shapes):
+                try:
+                    hl_count = shape.Hyperlinks.Count
+                except Exception:
+                    continue
+                for i in range(1, hl_count + 1):
+                    try:
+                        hl = shape.Hyperlinks.Item(i)
+                        addr = hl.Address or ''
+                        # Если старый путь не указан — пропускаем (неизвестно какую ссылку менять)
+                        if not old_lower:
+                            continue
+                        if old_lower in addr.lower():
+                            hl.Address = new_table_path
+                            if new_table_number:
+                                hl.Description = new_table_number
+                            replaced += 1
+                    except Exception:
+                        continue
         doc.Save()
         stem = os.path.splitext(os.path.basename(visio_path))[0]
-        pdf_path = os.path.join(MAPS_PDF_FOLDER, stem + '.pdf')
-        os.makedirs(MAPS_PDF_FOLDER, exist_ok=True)
+        out_dir = pdf_folder if pdf_folder else MAPS_PDF_FOLDER
+        pdf_path = os.path.join(out_dir, stem + '.pdf')
+        os.makedirs(out_dir, exist_ok=True)
         pdf_exported = False
         pdf_err = ''
         for args in [(1, pdf_path, 0, 0), (1, pdf_path, 0), (1, pdf_path)]:
@@ -1631,7 +1667,7 @@ class UstavkiFoldersApp(_BASE_CLASS):
 
     def _build_step6(self, parent):
         parent.columnconfigure(0, weight=1)
-        parent.rowconfigure(2, weight=1)
+        parent.rowconfigure(3, weight=1)
 
         cfg = ttk.LabelFrame(parent, text="Пути к папкам", padding=6)
         cfg.grid(row=0, column=0, sticky='ew', pady=(0, 4))
@@ -1743,6 +1779,7 @@ class UstavkiFoldersApp(_BASE_CLASS):
                + "\n\nЭто откроет Microsoft Visio для каждого объекта!\nПродолжить?")
         if not messagebox.askyesno("Подтверждение", msg, parent=self):
             return
+        pdf_folder = self._pdf_folder_var.get()
         for entry in self.ustavki_entries:
             short = match_object_to_short_name(entry.get('object_name', ''))
             if not short:
@@ -1755,8 +1792,10 @@ class UstavkiFoldersApp(_BASE_CLASS):
             old_path  = entry.get('archive_candidate', '')
             new_path  = entry.get('current_path', entry.get('file_path', ''))
             table_num = entry.get('table_number', '')
+            if not old_path:
+                self._log('6', f"  ПРОПУСК {short}: не найден предыдущий файл (archive_candidate пуст)"); continue
             self._log('6', f"Обновляю: {short}  {os.path.basename(visio_path)}")
-            ok, msg_r = update_visio_map(visio_path, old_path, new_path, table_num)
+            ok, msg_r = update_visio_map(visio_path, old_path, new_path, table_num, pdf_folder)
             self._log('6', f"  {'OK' if ok else 'ERR'}  {msg_r}")
         self._save_current_session()
         self._log('6', "--- Завершено ---")
@@ -1782,10 +1821,16 @@ class UstavkiFoldersApp(_BASE_CLASS):
                f"  Старый:  {os.path.basename(old_path) if old_path else '(не указан)'}\n"
                f"  Новый:   {os.path.basename(new_path)}\n\n"
                f"Откроется Microsoft Visio. Продолжить?")
+        if not old_path:
+            messagebox.showwarning("Нет данных",
+                "Укажите старый файл таблицы (гиперссылку для замены).\n"
+                "Без него невозможно определить, какую ссылку заменить.", parent=self)
+            return
         if not messagebox.askyesno("Подтверждение", msg, parent=self):
             return
+        pdf_folder = self._pdf_folder_var.get()
         self._log('6', f"Обновляю: {short}  {os.path.basename(visio_path)}")
-        ok, result_msg = update_visio_map(visio_path, old_path, new_path, '')
+        ok, result_msg = update_visio_map(visio_path, old_path, new_path, '', pdf_folder)
         self._log('6', f"  {'OK' if ok else 'ERR'}  {result_msg}")
         self._save_current_session()
 
