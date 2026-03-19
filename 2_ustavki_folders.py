@@ -636,9 +636,35 @@ def _visio_iter_shapes(shapes_coll):
             pass
 
 
+def _win_basename(path: str) -> str:
+    """Возвращает имя файла из Windows-пути (работает на любой ОС)."""
+    return path.replace('/', '\\').split('\\')[-1]
+
+
+def _extract_table_num_from_filename(path: str) -> str:
+    """
+    Извлекает номер таблицы (YY-NNN) из имени файла.
+    Пример: 'ВТЭЦ-2 ШСМВ-110-МТЗ ТЗНП-23-220.docx' → '23-220'
+    Берёт ПОСЛЕДНЕЕ вхождение шаблона \\d{2}-\\d+ в стебле имени.
+    """
+    stem = os.path.splitext(_win_basename(path))[0]
+    matches = re.findall(r'\d{2}-\d+', stem)
+    return matches[-1] if matches else ''
+
+
 def update_visio_map(visio_path: str, old_table_path: str,
                      new_table_path: str, new_table_number: str,
                      pdf_folder: str = '') -> tuple:
+    """
+    Обновляет гиперссылку в карте уставок (Visio):
+      - Ищет гиперссылку по имени файла (basename) старой таблицы
+        (hl.Address хранится как относительный путь → точное сравнение
+         абсолютных путей всегда даёт 0; ищем по имени файла)
+      - Заменяет Address на абсолютный путь к новой таблице
+      - В Description записывает старое имя файла (история замены)
+      - В shape.Text заменяет YY-NNN старой таблицы на номер новой
+      - Сохраняет .vsdx/.vsd и экспортирует PDF
+    """
     try:
         import win32com.client as win32
     except ImportError:
@@ -647,7 +673,13 @@ def update_visio_map(visio_path: str, old_table_path: str,
         return False, f"Файл не найден: {visio_path}"
     if not new_table_path:
         return False, "Не указан новый путь к файлу таблицы"
-    old_lower = old_table_path.lower() if old_table_path else ''
+
+    # Базовые имена для сравнения (без учёта регистра)
+    old_basename = _win_basename(old_table_path).lower() if old_table_path else ''
+    old_abs_lower = old_table_path.lower().replace('/', '\\') if old_table_path else ''
+    # Номер таблицы в старом файле (для замены в shape.Text)
+    old_yynum = _extract_table_num_from_filename(old_table_path) if old_table_path else ''
+
     visio = None
     try:
         visio = win32.Dispatch('Visio.Application')
@@ -664,14 +696,37 @@ def update_visio_map(visio_path: str, old_table_path: str,
                     try:
                         hl = shape.Hyperlinks.Item(i)
                         addr = hl.Address or ''
-                        # Если старый путь не указан — пропускаем (неизвестно какую ссылку менять)
-                        if not old_lower:
+                        if not old_basename:
                             continue
-                        if old_lower in addr.lower():
-                            hl.Address = new_table_path
-                            if new_table_number:
-                                hl.Description = new_table_number
-                            replaced += 1
+                        addr_norm = addr.replace('/', '\\')
+                        addr_basename = _win_basename(addr_norm).lower()
+
+                        # Сравниваем по имени файла (основной способ —
+                        # Visio хранит относительные пути)
+                        matched = (old_basename == addr_basename)
+                        # Запасной вариант: если Address уже абсолютный
+                        if not matched and old_abs_lower:
+                            matched = old_abs_lower in addr_norm.lower()
+
+                        if not matched:
+                            continue
+
+                        # Обновляем гиперссылку
+                        hl.Address = new_table_path
+                        # Description: старое имя файла как история замены
+                        hl.Description = _win_basename(old_table_path) if old_table_path else ''
+
+                        # Обновляем видимый текст фигуры:
+                        # заменяем YY-NNN старой таблицы на номер новой
+                        if new_table_number and old_yynum:
+                            try:
+                                old_text = shape.Text
+                                if old_yynum in old_text:
+                                    shape.Text = old_text.replace(old_yynum, new_table_number)
+                            except Exception:
+                                pass
+
+                        replaced += 1
                     except Exception:
                         continue
         doc.Save()
