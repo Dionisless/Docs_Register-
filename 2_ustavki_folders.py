@@ -25,10 +25,48 @@ import os
 import re
 import sys
 import shutil
+import struct
 import difflib
+import logging
+import traceback
 import tkinter as tk
 from tkinter import ttk, filedialog, messagebox
 from datetime import datetime
+
+# ── Лог-файл ─────────────────────────────────────────────────────────────────
+
+def _setup_file_logger() -> str:
+    """
+    Настраивает запись в лог-файл рядом с exe (или в папке скрипта).
+    Возвращает путь к лог-файлу.
+    """
+    base = getattr(sys, '_MEIPASS', None)
+    if base:
+        log_dir = os.path.dirname(sys.executable)
+    else:
+        log_dir = os.path.dirname(os.path.abspath(__file__))
+    log_path = os.path.join(log_dir, '2_UstavkiFolders.log')
+    logging.basicConfig(
+        filename=log_path,
+        filemode='a',
+        encoding='utf-8',
+        level=logging.DEBUG,
+        format='%(asctime)s  %(levelname)-8s  %(message)s',
+        datefmt='%Y-%m-%d %H:%M:%S',
+    )
+    logging.info('=' * 60)
+    logging.info('Запуск 2_UstavkiFolders')
+    return log_path
+
+APP_LOG_PATH = _setup_file_logger()
+
+
+def _global_excepthook(exc_type, exc_value, exc_tb):
+    msg = ''.join(traceback.format_exception(exc_type, exc_value, exc_tb))
+    logging.critical('НЕОБРАБОТАННОЕ ИСКЛЮЧЕНИЕ:\n%s', msg)
+    sys.__excepthook__(exc_type, exc_value, exc_tb)
+
+sys.excepthook = _global_excepthook
 
 
 def _resource_path(rel: str) -> str:
@@ -839,6 +877,7 @@ def update_visio_map(visio_path: str, old_table_path: str,
             return False, f"Неподдерживаемый формат: {ext}"
 
     except Exception as exc:
+        logging.error('update_visio_map(%s): %s', visio_path, traceback.format_exc())
         return False, str(exc)
 
 
@@ -1271,8 +1310,11 @@ class UstavkiFoldersApp(_BASE_CLASS):
         txt.configure(yscrollcommand=sb.set)
         txt.grid(row=1, column=0, sticky='nsew')
         sb.grid(row=1, column=1, sticky='ns')
-        ttk.Button(parent, text=btn_text, command=btn_cmd).grid(
-            row=2, column=0, pady=(6,0), sticky='w')
+        bf = ttk.Frame(parent)
+        bf.grid(row=2, column=0, pady=(6, 0), sticky='w')
+        ttk.Button(bf, text=btn_text, command=btn_cmd).pack(side='left', padx=(0, 8))
+        ttk.Button(bf, text='Скопировать лог',
+                   command=lambda k=key: self._copy_log(k)).pack(side='left')
         if not hasattr(self, '_logs'):
             self._logs = {}
         self._logs[key] = txt
@@ -1312,12 +1354,38 @@ class UstavkiFoldersApp(_BASE_CLASS):
     # ── Логирование ───────────────────────────────────────────────────────
 
     def _log(self, key: str, text: str):
+        # Пишем в лог-файл с временной меткой
+        level = logging.ERROR if text.upper().startswith('ОШИБКА') or text.upper().startswith('ERR') else logging.INFO
+        logging.log(level, '[шаг %s] %s', key, text)
+        # Пишем в виджет с временной меткой
+        ts = datetime.now().strftime('%H:%M:%S')
         widget = self._logs.get(key)
         if widget:
             widget.configure(state='normal')
-            widget.insert('end', text + '\n')
+            widget.insert('end', f'[{ts}] {text}\n')
             widget.see('end')
             widget.configure(state='disabled')
+
+    def _copy_log(self, key: str):
+        """Копирует содержимое лог-виджета в буфер обмена."""
+        widget = self._logs.get(key)
+        if not widget:
+            return
+        text = widget.get('1.0', 'end')
+        # Добавляем заголовок с путём к лог-файлу для контекста
+        header = (f'=== Лог шага {key} — {datetime.now().strftime("%Y-%m-%d %H:%M:%S")} ===\n'
+                  f'=== Лог-файл: {APP_LOG_PATH} ===\n')
+        full = header + text
+        try:
+            import win32clipboard
+            win32clipboard.OpenClipboard()
+            win32clipboard.EmptyClipboard()
+            win32clipboard.SetClipboardText(full, win32clipboard.CF_UNICODETEXT)
+            win32clipboard.CloseClipboard()
+        except Exception:
+            self.clipboard_clear()
+            self.clipboard_append(full)
+            self.update()
 
     # ── Шаг 0: файлы ─────────────────────────────────────────────────────
 
@@ -1774,6 +1842,8 @@ class UstavkiFoldersApp(_BASE_CLASS):
         bf.grid(row=2, column=0, pady=(6, 0), sticky='w')
         ttk.Button(bf, text="Создать отчёт изменений →",
                    command=self._create_changes_report).pack(side='left', padx=4)
+        ttk.Button(bf, text='Скопировать лог',
+                   command=lambda: self._copy_log('5')).pack(side='left', padx=4)
 
     def _create_changes_report(self):
         if not HAS_DOCX:
@@ -1872,6 +1942,8 @@ class UstavkiFoldersApp(_BASE_CLASS):
                    command=self._update_maps_all).pack(side='left', padx=4)
         ttk.Button(bf, text="Обновить карту для одного объекта →",
                    command=self._update_single_map).pack(side='left', padx=4)
+        ttk.Button(bf, text='Скопировать лог',
+                   command=lambda: self._copy_log('6')).pack(side='left', padx=4)
 
     def _browse_folder(self, var: tk.StringVar):
         d = filedialog.askdirectory(initialdir=var.get() or os.path.expanduser('~'), parent=self)
