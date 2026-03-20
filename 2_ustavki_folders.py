@@ -616,26 +616,6 @@ def generate_changes_report(entries: list, output_path: str):
 
 # ── Шаг 6: Visio ──────────────────────────────────────────────────────────────
 
-def _visio_iter_shapes(shapes_coll):
-    """Рекурсивно обходит все фигуры включая sub-shapes внутри групп."""
-    count = 0
-    try:
-        count = shapes_coll.Count
-    except Exception:
-        return
-    for i in range(1, count + 1):
-        try:
-            shp = shapes_coll.Item(i)
-        except Exception:
-            continue
-        yield shp
-        try:
-            if shp.Shapes.Count > 0:
-                yield from _visio_iter_shapes(shp.Shapes)
-        except Exception:
-            pass
-
-
 def _win_basename(path: str) -> str:
     """Возвращает имя файла из Windows-пути (работает на любой ОС)."""
     return path.replace('/', '\\').split('\\')[-1]
@@ -652,110 +632,214 @@ def _extract_table_num_from_filename(path: str) -> str:
     return matches[-1] if matches else ''
 
 
+def _update_vsdx_binary(vsdx_path: str, old_basename_lower: str,
+                        new_table_path: str, old_yynum: str,
+                        new_table_number: str) -> tuple:
+    """
+    Прямая правка .vsdx (ZIP+XML) без запуска Visio.
+    Заменяет Address гиперссылки и номер таблицы в тексте фигуры.
+    Возвращает (replaced_links, replaced_texts).
+    """
+    import zipfile, tempfile, shutil
+    replaced_links = 0
+    replaced_texts = 0
+
+    tmp_fd, tmp_path = tempfile.mkstemp(suffix='.vsdx')
+    os.close(tmp_fd)
+    try:
+        with zipfile.ZipFile(vsdx_path, 'r') as zin, \
+             zipfile.ZipFile(tmp_path, 'w', zipfile.ZIP_DEFLATED) as zout:
+            for item in zin.infolist():
+                data = zin.read(item.filename)
+                if (item.filename.startswith('visio/pages/page') and
+                        item.filename.endswith('.xml')):
+                    content = data.decode('utf-8')
+
+                    # Замена Address в гиперссылках
+                    def _repl_addr(m):
+                        nonlocal replaced_links
+                        addr = m.group(1)
+                        if _win_basename(addr).lower() == old_basename_lower:
+                            replaced_links += 1
+                            return f"N='Address' V='{new_table_path}'"
+                        return m.group(0)
+                    content = re.sub(
+                        r"N='Address' V='([^']*)'", _repl_addr, content)
+
+                    # Замена YY-NNN в тексте фигур
+                    if old_yynum and new_table_number:
+                        def _repl_text(m):
+                            nonlocal replaced_texts
+                            inner = m.group(1)
+                            if old_yynum in inner:
+                                replaced_texts += 1
+                                return f'<Text>{inner.replace(old_yynum, new_table_number)}</Text>'
+                            return m.group(0)
+                        content = re.sub(
+                            r'<Text>(.*?)</Text>', _repl_text,
+                            content, flags=re.DOTALL)
+
+                    data = content.encode('utf-8')
+                zout.writestr(item, data)
+        shutil.move(tmp_path, vsdx_path)
+    except Exception:
+        if os.path.exists(tmp_path):
+            os.remove(tmp_path)
+        raise
+    return replaced_links, replaced_texts
+
+
+def _update_vsd_binary(vsd_path: str, old_basename_lower: str,
+                       new_table_path: str) -> int:
+    """
+    Прямая правка .vsd (OLE2 Compound Binary) без запуска Visio.
+    Гиперссылки хранятся как VT_LPWSTR (тип 0x001F) в потоке
+    DocumentSummaryInformation (в нём же — все ссылки из DSI).
+    Возвращает количество замененных ссылок.
+    """
+    try:
+        import olefile
+    except ImportError:
+        raise RuntimeError("olefile не установлен: pip install olefile")
+
+    SECTOR = 512
+    VT_LPWSTR = b'\x1f\x00\x00\x00'
+
+    with open(vsd_path, 'rb') as f:
+        raw = bytearray(f.read())
+
+    with olefile.OleFileIO(vsd_path) as ole:
+        def _fat_chain(start):
+            ENDOFCHAIN = 0xFFFFFFFE
+            FREESECT = 0xFFFFFFFF
+            sects = []
+            cur = start
+            while cur not in (ENDOFCHAIN, FREESECT) and cur < len(ole.fat):
+                sects.append(cur)
+                cur = ole.fat[cur]
+            return sects
+
+        dsi_sid = ole._find('\x05DocumentSummaryInformation')
+        dsi_entry = ole.direntries[dsi_sid]
+        dsi_start = dsi_entry.isectStart
+        dsi_size = dsi_entry.sizeLow
+        dsi_sects = _fat_chain(dsi_start)
+
+        # Directory entry offset in raw file (128 bytes per entry, 4 per sector)
+        dir_start = struct.unpack_from('<I', raw, 0x30)[0]
+        dir_sects = _fat_chain(dir_start)
+        dir_sect_idx = dsi_entry.sid // 4
+        dir_raw_off = (dir_sects[dir_sect_idx] + 1) * SECTOR + (dsi_entry.sid % 4) * 128
+
+    # Читаем DSI stream из секторов
+    dsi_data = bytearray()
+    for s in dsi_sects:
+        off = (s + 1) * SECTOR
+        dsi_data.extend(raw[off:off + SECTOR])
+    dsi_data = dsi_data[:dsi_size]
+
+    new_enc = new_table_path.encode('utf-16-le')
+    new_n1 = len(new_table_path) + 1
+    replaced = 0
+
+    pos = 0
+    while pos < len(dsi_data) - 8:
+        if dsi_data[pos:pos+4] != VT_LPWSTR:
+            pos += 1
+            continue
+        n1 = struct.unpack_from('<I', dsi_data, pos + 4)[0]
+        if n1 < 2 or n1 > 4096:
+            pos += 8
+            continue
+        str_chars = n1 - 1
+        str_bytes = str_chars * 2
+        str_start = pos + 8
+        if str_start + str_bytes + 2 > len(dsi_data):
+            pos += 8
+            continue
+        try:
+            s = dsi_data[str_start:str_start + str_bytes].decode('utf-16-le')
+        except Exception:
+            pos += 8 + str_bytes + 2
+            continue
+
+        if _win_basename(s).lower() == old_basename_lower:
+            old_rec_len = 8 + n1 * 2
+            new_rec = struct.pack('<II', 0x1F, new_n1) + new_enc + b'\x00\x00'
+            allocated = len(dsi_sects) * SECTOR
+            new_size = len(dsi_data) - old_rec_len + len(new_rec)
+            if new_size > allocated:
+                raise RuntimeError(
+                    f"Новая строка не помещается в поток DSI "
+                    f"({new_size} > {allocated}): сократите путь")
+            dsi_data[pos:pos + old_rec_len] = new_rec
+            replaced += 1
+            pos += len(new_rec)
+        else:
+            pos += 8 + n1 * 2
+
+    if replaced == 0:
+        return 0
+
+    # Пишем dsi_data обратно в сектора
+    off_in_stream = 0
+    for s in dsi_sects:
+        raw_off = (s + 1) * SECTOR
+        chunk = bytes(dsi_data[off_in_stream:off_in_stream + SECTOR])
+        chunk = chunk.ljust(SECTOR, b'\x00')
+        raw[raw_off:raw_off + SECTOR] = chunk[:SECTOR]
+        off_in_stream += SECTOR
+
+    # Обновляем sizeLow в directory entry (+120 байт от начала записи)
+    struct.pack_into('<I', raw, dir_raw_off + 120, len(dsi_data))
+
+    with open(vsd_path, 'wb') as f:
+        f.write(raw)
+
+    return replaced
+
+
 def update_visio_map(visio_path: str, old_table_path: str,
                      new_table_path: str, new_table_number: str,
                      pdf_folder: str = '') -> tuple:
     """
-    Обновляет гиперссылку в карте уставок (Visio):
-      - Ищет гиперссылку по имени файла (basename) старой таблицы
-        (hl.Address хранится как относительный путь → точное сравнение
-         абсолютных путей всегда даёт 0; ищем по имени файла)
-      - Заменяет Address на абсолютный путь к новой таблице
-      - В Description записывает старое имя файла (история замены)
-      - В shape.Text заменяет YY-NNN старой таблицы на номер новой
-      - Сохраняет .vsdx/.vsd и экспортирует PDF
+    Обновляет гиперссылку в карте уставок (Visio) БИНАРНО — без запуска Visio.
+      .vsdx: правит XML внутри ZIP (Address + текст фигуры)
+      .vsd:  правит OLE2-поток DocumentSummaryInformation (только Address)
+    PDF не экспортируется (требует Visio COM).
     """
-    try:
-        import win32com.client as win32
-    except ImportError:
-        return False, "win32com не доступен (нужен pywin32)"
     if not os.path.exists(visio_path):
         return False, f"Файл не найден: {visio_path}"
     if not new_table_path:
         return False, "Не указан новый путь к файлу таблицы"
+    if not old_table_path:
+        return False, "Не указан старый путь к файлу таблицы"
 
-    # Базовые имена для сравнения (без учёта регистра)
-    old_basename = _win_basename(old_table_path).lower() if old_table_path else ''
-    old_abs_lower = old_table_path.lower().replace('/', '\\') if old_table_path else ''
-    # Номер таблицы в старом файле (для замены в shape.Text)
-    old_yynum = _extract_table_num_from_filename(old_table_path) if old_table_path else ''
+    old_basename_lower = _win_basename(old_table_path).lower()
+    old_yynum = _extract_table_num_from_filename(old_table_path)
+    ext = os.path.splitext(visio_path)[1].lower()
 
-    visio = None
     try:
-        visio = win32.Dispatch('Visio.Application')
-        visio.Visible = False
-        doc = visio.Documents.Open(os.path.abspath(visio_path))
-        replaced = 0
-        for page in doc.Pages:
-            for shape in _visio_iter_shapes(page.Shapes):
-                try:
-                    hl_count = shape.Hyperlinks.Count
-                except Exception:
-                    continue
-                for i in range(1, hl_count + 1):
-                    try:
-                        hl = shape.Hyperlinks.Item(i)
-                        addr = hl.Address or ''
-                        if not old_basename:
-                            continue
-                        addr_norm = addr.replace('/', '\\')
-                        addr_basename = _win_basename(addr_norm).lower()
+        if ext == '.vsdx':
+            replaced_links, replaced_texts = _update_vsdx_binary(
+                visio_path, old_basename_lower,
+                new_table_path, old_yynum, new_table_number)
+            msg = (f"Заменено ссылок: {replaced_links}, "
+                   f"текстов: {replaced_texts} (PDF: требует Visio)")
+            return True, msg
 
-                        # Сравниваем по имени файла (основной способ —
-                        # Visio хранит относительные пути)
-                        matched = (old_basename == addr_basename)
-                        # Запасной вариант: если Address уже абсолютный
-                        if not matched and old_abs_lower:
-                            matched = old_abs_lower in addr_norm.lower()
+        elif ext == '.vsd':
+            replaced = _update_vsd_binary(
+                visio_path, old_basename_lower, new_table_path)
+            msg = (f"Заменено ссылок: {replaced} "
+                   f"(текст фигур и PDF: требует Visio)")
+            return True, msg
 
-                        if not matched:
-                            continue
-
-                        # Обновляем гиперссылку
-                        hl.Address = new_table_path
-                        # Description: старое имя файла как история замены
-                        hl.Description = _win_basename(old_table_path) if old_table_path else ''
-
-                        # Обновляем видимый текст фигуры:
-                        # заменяем YY-NNN старой таблицы на номер новой
-                        if new_table_number and old_yynum:
-                            try:
-                                old_text = shape.Text
-                                if old_yynum in old_text:
-                                    shape.Text = old_text.replace(old_yynum, new_table_number)
-                            except Exception:
-                                pass
-
-                        replaced += 1
-                    except Exception:
-                        continue
-        doc.Save()
-        stem = os.path.splitext(os.path.basename(visio_path))[0]
-        out_dir = pdf_folder if pdf_folder else MAPS_PDF_FOLDER
-        pdf_path = os.path.join(out_dir, stem + '.pdf')
-        os.makedirs(out_dir, exist_ok=True)
-        pdf_exported = False
-        pdf_err = ''
-        for args in [(1, pdf_path, 0, 0), (1, pdf_path, 0), (1, pdf_path)]:
-            try:
-                doc.ExportAsFixedFormat(*args)
-                pdf_exported = True
-                break
-            except Exception as e:
-                pdf_err = str(e)
-        doc.Close()
-        if pdf_exported:
-            return True, f"Заменено ссылок: {replaced}, PDF: {pdf_path}"
         else:
-            return True, f"Заменено ссылок: {replaced} (PDF не экспортирован: {pdf_err})"
+            return False, f"Неподдерживаемый формат: {ext}"
+
     except Exception as exc:
         return False, str(exc)
-    finally:
-        try:
-            if visio:
-                visio.Quit()
-        except Exception:
-            pass
 
 
 # ── ДЭБ: загрузка карт уставок ───────────────────────────────────────────────

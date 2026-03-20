@@ -109,7 +109,7 @@ def main():
          os.path.join(icons_dir, "1_letter.ico")),
         # 2_UstavkiFolders включает шаги 0–7 (Visio + ДЭБ)
         ("2_ustavki_folders.py", "2_UstavkiFolders", None,
-         WIN32COM_ARGS + SELENIUM_ARGS,
+         WIN32COM_ARGS + SELENIUM_ARGS + ["--collect-all=olefile"],
          os.path.join(icons_dir, "2_folders.ico")),
     ]
 
