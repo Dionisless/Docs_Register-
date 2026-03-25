@@ -29,10 +29,12 @@
 import os
 import re
 import sys
+import json
 import time
 import shutil
 import getpass
 import difflib
+import threading
 import tkinter as tk
 from tkinter import ttk, filedialog, messagebox
 from datetime import datetime
@@ -134,6 +136,132 @@ OBJECT_SHORT_NAMES = [
     "Хороль","Чайка","Черемшаны","Черниговка","Чуркин","Шахта 7","Штыково","Южная",
     "Ярославка",
 ]
+
+
+# ── Настройки ────────────────────────────────────────────────────────────────
+
+def get_settings_path() -> str:
+    """Путь к settings.json — рядом с exe (или скриптом)."""
+    if getattr(sys, 'frozen', False):
+        base = os.path.dirname(sys.executable)
+    else:
+        base = os.path.dirname(os.path.abspath(__file__))
+    return os.path.join(base, 'settings.json')
+
+
+def load_settings() -> dict:
+    try:
+        with open(get_settings_path(), 'r', encoding='utf-8') as f:
+            return json.load(f)
+    except Exception:
+        return {}
+
+
+def save_settings(settings: dict):
+    try:
+        with open(get_settings_path(), 'w', encoding='utf-8') as f:
+            json.dump(settings, f, ensure_ascii=False, indent=2)
+    except Exception as exc:
+        raise RuntimeError(f"Не удалось сохранить настройки: {exc}")
+
+
+def get_registrar_name(settings: dict) -> str:
+    """Возвращает сокращение для текущего пользователя Windows."""
+    username = getpass.getuser()
+    return settings.get('user_map', {}).get(username, username)
+
+
+# ── Мониторинг ViewDir ────────────────────────────────────────────────────────
+
+class ViewDirWatcher:
+    """
+    Фоновый поток, следящий за появлением новых файлов в LanDocs ViewDir.
+    Копирует самый свежий файл в локальный кэш.
+    Если файл удаляется из ViewDir (например, через 5 с R7 Офис),
+    кэш НЕ перезаписывается более старым файлом.
+    """
+
+    def __init__(self):
+        local_app = os.environ.get('LOCALAPPDATA') or os.path.join(
+            os.environ.get('USERPROFILE', ''), 'AppData', 'Local')
+        self._view_dir = os.path.join(local_app, 'Temp', 'ViewDir')
+
+        # Кэш-папка рядом с exe/скриптом
+        if getattr(sys, 'frozen', False):
+            _base = os.path.dirname(sys.executable)
+        else:
+            _base = os.path.dirname(os.path.abspath(__file__))
+        self._cache_dir = os.path.join(_base, '_landocs_cache')
+        os.makedirs(self._cache_dir, exist_ok=True)
+
+        self._cached_path  = ''    # путь к закэшированной копии
+        self._cached_ctime = 0.0   # время создания закэшированного файла
+        self._running      = False
+        self._thread: threading.Thread | None = None
+
+    # ── Публичный API ──────────────────────────────────────────────────────
+
+    def start(self):
+        """Запустить мониторинг (если ещё не запущен)."""
+        if self._running:
+            return
+        self._running = True
+        # Сразу сканируем, чтобы не пропустить уже открытый файл
+        self._update_cache()
+        self._thread = threading.Thread(target=self._watch_loop, daemon=True)
+        self._thread.start()
+
+    def stop(self):
+        """Остановить мониторинг."""
+        self._running = False
+
+    def reset(self):
+        """Сбросить кэш и перезапустить."""
+        self.stop()
+        self._cached_path  = ''
+        self._cached_ctime = 0.0
+        self.start()
+
+    def get_cached_path(self) -> str:
+        """Путь к последнему закэшированному файлу (пустая строка — ещё ничего)."""
+        return self._cached_path
+
+    # ── Внутренние методы ─────────────────────────────────────────────────
+
+    def _watch_loop(self):
+        while self._running:
+            self._update_cache()
+            time.sleep(1)
+
+    def _update_cache(self):
+        """Ищет самый новый файл в ViewDir; обновляет кэш, если он свежее."""
+        if not os.path.isdir(self._view_dir):
+            return
+        latest_path, latest_ctime = '', 0.0
+        try:
+            for dirpath, _, filenames in os.walk(self._view_dir):
+                for fname in filenames:
+                    fpath = os.path.join(dirpath, fname)
+                    try:
+                        ctime = os.path.getctime(fpath)
+                        if ctime > latest_ctime:
+                            latest_ctime = ctime
+                            latest_path  = fpath
+                    except OSError:
+                        pass
+        except OSError:
+            return
+
+        # Обновляем кэш ТОЛЬКО если нашли файл НОВЕЕ текущего кэша
+        if latest_path and latest_ctime > self._cached_ctime:
+            try:
+                ext = os.path.splitext(latest_path)[1] or '.tmp'
+                cache_file = os.path.join(self._cache_dir, f'cached_letter{ext}')
+                shutil.copy2(latest_path, cache_file)
+                self._cached_path  = cache_file
+                self._cached_ctime = latest_ctime
+            except Exception:
+                pass
 
 
 # ── Клавиатура / буфер обмена ────────────────────────────────────────────────
@@ -1196,6 +1324,9 @@ class RegistrationApp(_BASE_CLASS):
 
     def __init__(self):
         super().__init__()
+        self._settings = load_settings()
+        self._watcher  = ViewDirWatcher()
+
         self.in_data  = {}
         self.out_data = {}
         self.ustavki_entries: list = []   # list of dict
@@ -1207,6 +1338,7 @@ class RegistrationApp(_BASE_CLASS):
         self._tree = None
         self._archive_tree = None
         self._step_log_widgets: dict = {}  # step_name → tk.Text
+        self._cfg_tree = None
 
         self.title("Регистрация корреспонденции v2")
         self.resizable(True, True)
@@ -1251,7 +1383,7 @@ class RegistrationApp(_BASE_CLASS):
         btn_frame.grid(row=2, column=0, pady=4)
         ttk.Button(btn_frame, text="Зарегистрировать в журнал",
                    command=self._on_register).pack(side='left', padx=6)
-        self._reparse_btn = ttk.Button(btn_frame, text="Запустить парсинг LanDocs",
+        self._reparse_btn = ttk.Button(btn_frame, text="Считать из LanDocs",
                                        command=self._start_reparse)
         self._reparse_btn.pack(side='left', padx=6)
         ttk.Button(btn_frame, text="Закрыть",
@@ -1263,6 +1395,12 @@ class RegistrationApp(_BASE_CLASS):
         ust_tab.columnconfigure(0, weight=1)
         ust_tab.rowconfigure(1, weight=1)
         self._build_ustavki_tab(ust_tab)
+
+        # ── Вкладка 3: Настройки ──
+        cfg_tab = ttk.Frame(self._top_nb, padding=8)
+        self._top_nb.add(cfg_tab, text="  Настройки  ")
+        cfg_tab.columnconfigure(0, weight=1)
+        self._build_settings_tab(cfg_tab)
 
     def _build_incoming_tab(self, frame):
         frame.columnconfigure(1, weight=1)
@@ -1374,6 +1512,115 @@ class RegistrationApp(_BASE_CLASS):
         ttk.Label(inp, textvariable=self.out_folder_num_var,
                   anchor='w', foreground='navy').grid(row=4, column=1, sticky='w', pady=4)
 
+
+    def _build_settings_tab(self, parent):
+        """Вкладка настроек: таблица соответствия логин Windows → сокращение."""
+        parent.rowconfigure(1, weight=1)
+
+        # ── Информация о текущем пользователе ──────────────────────────
+        info_frame = ttk.LabelFrame(parent, text="Текущий пользователь", padding=8)
+        info_frame.grid(row=0, column=0, sticky='ew', pady=(0, 8))
+        info_frame.columnconfigure(1, weight=1)
+
+        username = getpass.getuser()
+        ttk.Label(info_frame, text="Имя в Windows:").grid(row=0, column=0, sticky='e', padx=(0, 6))
+        ttk.Label(info_frame, text=username, foreground='navy').grid(row=0, column=1, sticky='w')
+
+        self._cur_abbr_var = tk.StringVar()
+        ttk.Label(info_frame, text="Сокращение (из таблицы):").grid(row=1, column=0, sticky='e', padx=(0, 6))
+        ttk.Label(info_frame, textvariable=self._cur_abbr_var, foreground='navy').grid(row=1, column=1, sticky='w')
+        self._refresh_cur_abbr()
+
+        # ── Таблица соответствий ────────────────────────────────────────
+        tbl_frame = ttk.LabelFrame(parent, text="Соответствие: имя пользователя → сокращение", padding=8)
+        tbl_frame.grid(row=1, column=0, sticky='nsew', pady=(0, 6))
+        tbl_frame.columnconfigure(0, weight=1)
+        tbl_frame.rowconfigure(0, weight=1)
+
+        cols = ('username', 'abbr')
+        self._cfg_tree = ttk.Treeview(tbl_frame, columns=cols, show='headings', height=8)
+        self._cfg_tree.heading('username', text='Имя пользователя (Windows login)')
+        self._cfg_tree.heading('abbr',     text='Сокращение')
+        self._cfg_tree.column('username', width=260)
+        self._cfg_tree.column('abbr',     width=140)
+        vsb = ttk.Scrollbar(tbl_frame, orient='vertical', command=self._cfg_tree.yview)
+        self._cfg_tree.configure(yscrollcommand=vsb.set)
+        self._cfg_tree.grid(row=0, column=0, sticky='nsew')
+        vsb.grid(row=0, column=1, sticky='ns')
+        self._cfg_tree.bind('<<TreeviewSelect>>', self._on_cfg_select)
+
+        # ── Форма добавления/изменения ─────────────────────────────────
+        form_frame = ttk.Frame(parent)
+        form_frame.grid(row=2, column=0, sticky='ew', pady=(0, 4))
+        form_frame.columnconfigure(1, weight=1)
+        form_frame.columnconfigure(3, weight=1)
+
+        ttk.Label(form_frame, text="Имя пользователя:").grid(row=0, column=0, sticky='e', padx=(0, 4))
+        self._cfg_user_var = tk.StringVar()
+        ttk.Entry(form_frame, textvariable=self._cfg_user_var, width=28).grid(row=0, column=1, sticky='ew', padx=(0, 12))
+        ttk.Label(form_frame, text="Сокращение:").grid(row=0, column=2, sticky='e', padx=(0, 4))
+        self._cfg_abbr_var = tk.StringVar()
+        ttk.Entry(form_frame, textvariable=self._cfg_abbr_var, width=14).grid(row=0, column=3, sticky='ew')
+
+        # ── Кнопки ──────────────────────────────────────────────────────
+        btn_frame = ttk.Frame(parent)
+        btn_frame.grid(row=3, column=0, pady=4)
+        ttk.Button(btn_frame, text="Добавить / обновить",
+                   command=self._cfg_add).pack(side='left', padx=4)
+        ttk.Button(btn_frame, text="Удалить выбранную",
+                   command=self._cfg_remove).pack(side='left', padx=4)
+        ttk.Button(btn_frame, text="Подставить мой логин",
+                   command=lambda: self._cfg_user_var.set(getpass.getuser())).pack(side='left', padx=4)
+        ttk.Button(btn_frame, text="Сохранить настройки",
+                   command=self._cfg_save).pack(side='left', padx=4)
+
+        self._cfg_load_table()
+
+    def _refresh_cur_abbr(self):
+        if hasattr(self, '_cur_abbr_var'):
+            self._cur_abbr_var.set(get_registrar_name(self._settings))
+
+    def _cfg_load_table(self):
+        """Загрузить таблицу user_map из self._settings в treeview."""
+        for item in self._cfg_tree.get_children():
+            self._cfg_tree.delete(item)
+        for uname, abbr in self._settings.get('user_map', {}).items():
+            self._cfg_tree.insert('', 'end', values=(uname, abbr))
+
+    def _on_cfg_select(self, _event=None):
+        sel = self._cfg_tree.selection()
+        if not sel:
+            return
+        vals = self._cfg_tree.item(sel[0], 'values')
+        self._cfg_user_var.set(vals[0])
+        self._cfg_abbr_var.set(vals[1])
+
+    def _cfg_add(self):
+        uname = self._cfg_user_var.get().strip()
+        abbr  = self._cfg_abbr_var.get().strip()
+        if not uname or not abbr:
+            messagebox.showwarning("Внимание", "Заполните оба поля.", parent=self)
+            return
+        user_map = self._settings.setdefault('user_map', {})
+        user_map[uname] = abbr
+        self._cfg_load_table()
+        self._refresh_cur_abbr()
+
+    def _cfg_remove(self):
+        sel = self._cfg_tree.selection()
+        if not sel:
+            return
+        uname = self._cfg_tree.item(sel[0], 'values')[0]
+        self._settings.get('user_map', {}).pop(uname, None)
+        self._cfg_load_table()
+        self._refresh_cur_abbr()
+
+    def _cfg_save(self):
+        try:
+            save_settings(self._settings)
+            messagebox.showinfo("Готово", "Настройки сохранены.", parent=self)
+        except Exception as exc:
+            messagebox.showerror("Ошибка", str(exc), parent=self)
 
     def _build_ustavki_tab(self, parent):
         parent.columnconfigure(0, weight=1)
@@ -1635,6 +1882,8 @@ class RegistrationApp(_BASE_CLASS):
 
     def _start_reparse(self):
         self._reparse_btn.config(state='disabled')
+        # Запускаем/сбрасываем мониторинг ViewDir с этого момента
+        self._watcher.reset()
         self.iconify()
         self._reparse_countdown(3)
 
@@ -1725,7 +1974,7 @@ class RegistrationApp(_BASE_CLASS):
             signed_by = f"{signatory}\n{correspondent}" if correspondent else signatory
             hyperlink_path = self.in_save_path_var.get()
             if hyperlink_path:
-                src = find_latest_in_viewdir()
+                src = self._watcher.get_cached_path() or find_latest_in_viewdir()
                 if src:
                     shutil.copy2(src, hyperlink_path)
                 else:
@@ -1740,11 +1989,12 @@ class RegistrationApp(_BASE_CLASS):
                 'author':         self.in_author_var.get(),
                 'signed_by':      signed_by,
                 'folder_num':     self.in_folder_num_var.get(),
-                'who_registered': getpass.getuser(),
+                'who_registered': get_registrar_name(self._settings),
                 'keywords':       self.in_keywords_var.get(),
                 'related':        d.get('related',''),
                 'hyperlink_path': hyperlink_path,
             })
+            self._watcher.stop()
             messagebox.showinfo("Готово", "Запись добавлена в журнал!", parent=self)
             self._refresh_letter_info()
         except Exception as exc:
@@ -1758,7 +2008,7 @@ class RegistrationApp(_BASE_CLASS):
             d = self.out_data
             hyperlink_path = self.out_save_path_var.get()
             if hyperlink_path:
-                src = find_latest_in_viewdir()
+                src = self._watcher.get_cached_path() or find_latest_in_viewdir()
                 if src:
                     shutil.copy2(src, hyperlink_path)
                 else:
@@ -1776,6 +2026,7 @@ class RegistrationApp(_BASE_CLASS):
                 'control':        self.out_control_var.get(),
                 'hyperlink_path': hyperlink_path,
             })
+            self._watcher.stop()
             messagebox.showinfo("Готово", "Запись добавлена в журнал!", parent=self)
         except Exception as exc:
             messagebox.showerror("Ошибка", str(exc), parent=self)
