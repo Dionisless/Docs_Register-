@@ -111,6 +111,10 @@ def main():
         ("2_ustavki_folders.py", "2_UstavkiFolders", None,
          WIN32COM_ARGS + SELENIUM_ARGS + ["--collect-all=olefile"],
          os.path.join(icons_dir, "2_folders.ico")),
+        # LanDocs_Registrator — регистрация корреспонденции v2
+        ("landocs_register.py", "LanDocs_Registrator", None,
+         WIN32COM_ARGS + SELENIUM_ARGS + ["--collect-all=olefile"],
+         os.path.join(icons_dir, "1_letter.ico")),
     ]
 
     os.makedirs(os.path.join(BASE, "dist"), exist_ok=True)
