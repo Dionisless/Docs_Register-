@@ -23,6 +23,7 @@ import json
 import time
 import shutil
 import getpass
+import threading
 import subprocess
 import tkinter as tk
 from tkinter import ttk, filedialog, messagebox
@@ -71,19 +72,25 @@ LETTER_FILETYPES = [
 
 # ── Настройки ─────────────────────────────────────────────────────────────────
 
+def _exe_dir() -> str:
+    """Папка рядом с exe (или скриптом)."""
+    if getattr(sys, 'frozen', False):
+        return os.path.dirname(sys.executable)
+    return os.path.dirname(os.path.abspath(__file__))
+
 def _appdata_dir() -> str:
-    """Возвращает %APPDATA%\\DocsRegister, создаёт если нет."""
+    """Возвращает %APPDATA%\\DocsRegister — только для временных файлов сессии."""
     appdata = os.environ.get('APPDATA') or os.path.join(
         os.environ.get('USERPROFILE', ''), 'AppData', 'Roaming')
     d = os.path.join(appdata, 'DocsRegister')
     os.makedirs(d, exist_ok=True)
     return d
 
-SETTINGS_FILE = os.path.join(_appdata_dir(), 'letter_settings.json')
+SETTINGS_FILE = os.path.join(_exe_dir(), 'settings.json')
 
 _settings: dict = {
     'org_abbreviations': {},
-    'registrar_name': '',
+    'user_map': {},           # логин Windows → сокращение регистратора
     'ustavki_exe_path': '',
 }
 
@@ -103,6 +110,86 @@ def save_settings():
             json.dump(_settings, f, ensure_ascii=False, indent=2)
     except Exception as e:
         messagebox.showerror("Ошибка", f"Не удалось сохранить настройки:\n{e}")
+
+def get_registrar_name() -> str:
+    """Возвращает сокращение для текущего пользователя Windows из user_map."""
+    username = getpass.getuser()
+    return _settings.get('user_map', {}).get(username, username)
+
+# ── Мониторинг ViewDir ────────────────────────────────────────────────────────
+
+class ViewDirWatcher:
+    """
+    Фоновый поток, следящий за появлением новых файлов в LanDocs ViewDir.
+    Копирует самый свежий файл в локальный кэш рядом с exe.
+    При удалении файла (R7 Офис удаляет через ~5 с) кэш не перезаписывается
+    более старым файлом.
+    """
+
+    def __init__(self):
+        local_app = os.environ.get('LOCALAPPDATA') or os.path.join(
+            os.environ.get('USERPROFILE', ''), 'AppData', 'Local')
+        self._view_dir = os.path.join(local_app, 'Temp', 'ViewDir')
+        self._cache_dir = os.path.join(_exe_dir(), '_landocs_cache')
+        os.makedirs(self._cache_dir, exist_ok=True)
+
+        self._cached_path  = ''
+        self._cached_ctime = 0.0
+        self._running      = False
+        self._thread: threading.Thread | None = None
+
+    def start(self):
+        if self._running:
+            return
+        self._running = True
+        self._update_cache()
+        self._thread = threading.Thread(target=self._watch_loop, daemon=True)
+        self._thread.start()
+
+    def stop(self):
+        self._running = False
+
+    def reset(self):
+        self.stop()
+        self._cached_path  = ''
+        self._cached_ctime = 0.0
+        self.start()
+
+    def get_cached_path(self) -> str:
+        return self._cached_path
+
+    def _watch_loop(self):
+        while self._running:
+            self._update_cache()
+            time.sleep(1)
+
+    def _update_cache(self):
+        if not os.path.isdir(self._view_dir):
+            return
+        latest_path, latest_ctime = '', 0.0
+        try:
+            for dirpath, _, filenames in os.walk(self._view_dir):
+                for fname in filenames:
+                    fpath = os.path.join(dirpath, fname)
+                    try:
+                        ctime = os.path.getctime(fpath)
+                        if ctime > latest_ctime:
+                            latest_ctime = ctime
+                            latest_path  = fpath
+                    except OSError:
+                        pass
+        except OSError:
+            return
+        if latest_path and latest_ctime > self._cached_ctime:
+            try:
+                ext = os.path.splitext(latest_path)[1] or '.tmp'
+                cache_file = os.path.join(self._cache_dir, f'cached_letter{ext}')
+                shutil.copy2(latest_path, cache_file)
+                self._cached_path  = cache_file
+                self._cached_ctime = latest_ctime
+            except Exception:
+                pass
+
 
 # ── Клавиатура / буфер обмена ────────────────────────────────────────────────
 
@@ -390,65 +477,150 @@ class SettingsWindow(tk.Toplevel):
         self.geometry(f"+{(sw-w)//2}+{(sh-h)//2}")
 
     def _build(self):
-        f = ttk.Frame(self, padding=12)
-        f.grid(row=0, column=0, sticky='nsew')
+        nb = ttk.Notebook(self, padding=4)
+        nb.grid(row=0, column=0, sticky='nsew')
         self.columnconfigure(0, weight=1)
         self.rowconfigure(0, weight=1)
+
+        tab_users = ttk.Frame(nb, padding=10)
+        tab_orgs  = ttk.Frame(nb, padding=10)
+        tab_misc  = ttk.Frame(nb, padding=10)
+        nb.add(tab_users, text="  Пользователи  ")
+        nb.add(tab_orgs,  text="  Сокращения орг.  ")
+        nb.add(tab_misc,  text="  Прочее  ")
+
+        self._build_users_tab(tab_users)
+        self._build_orgs_tab(tab_orgs)
+        self._build_misc_tab(tab_misc)
+
+        btn_frame = ttk.Frame(self)
+        btn_frame.grid(row=1, column=0, pady=(4, 8))
+        ttk.Button(btn_frame, text="Сохранить", command=self._save).pack(side='left', padx=6)
+        ttk.Button(btn_frame, text="Отмена",    command=self.destroy).pack(side='left', padx=6)
+
+    # ── Вкладка: пользователи ─────────────────────────────────────────────
+
+    def _build_users_tab(self, f):
+        f.columnconfigure(0, weight=1)
+        f.rowconfigure(1, weight=1)
+
+        # Текущий пользователь
+        info = ttk.LabelFrame(f, text="Текущий пользователь", padding=8)
+        info.grid(row=0, column=0, sticky='ew', pady=(0, 8))
+        info.columnconfigure(1, weight=1)
+        username = getpass.getuser()
+        ttk.Label(info, text="Имя в Windows:").grid(row=0, column=0, sticky='e', padx=(0, 6))
+        ttk.Label(info, text=username, foreground='navy').grid(row=0, column=1, sticky='w')
+        ttk.Label(info, text="Сокращение:").grid(row=1, column=0, sticky='e', padx=(0, 6))
+        self._cur_abbr_lbl = ttk.Label(info, foreground='navy')
+        self._cur_abbr_lbl.grid(row=1, column=1, sticky='w')
+        self._refresh_cur_abbr()
+
+        # Таблица user_map
+        tbl = ttk.LabelFrame(f, text="Имя пользователя Windows → Сокращение регистратора", padding=8)
+        tbl.grid(row=1, column=0, sticky='nsew', pady=(0, 6))
+        tbl.columnconfigure(0, weight=1)
+        tbl.rowconfigure(0, weight=1)
+
+        cols = ('username', 'abbr')
+        self._um_tree = ttk.Treeview(tbl, columns=cols, show='headings', height=7)
+        self._um_tree.heading('username', text='Имя пользователя (Windows login)')
+        self._um_tree.heading('abbr',     text='Сокращение')
+        self._um_tree.column('username', width=240)
+        self._um_tree.column('abbr',     width=120)
+        vsb = ttk.Scrollbar(tbl, orient='vertical', command=self._um_tree.yview)
+        self._um_tree.configure(yscrollcommand=vsb.set)
+        self._um_tree.grid(row=0, column=0, sticky='nsew')
+        vsb.grid(row=0, column=1, sticky='ns')
+        self._um_tree.bind('<<TreeviewSelect>>', self._on_um_select)
+
+        # Форма добавления
+        form = ttk.Frame(f)
+        form.grid(row=2, column=0, sticky='ew', pady=(0, 4))
+        form.columnconfigure(1, weight=1); form.columnconfigure(3, weight=1)
+        ttk.Label(form, text="Имя пользователя:").grid(row=0, column=0, sticky='e', padx=(0, 4))
+        self._um_user_var = tk.StringVar()
+        ttk.Entry(form, textvariable=self._um_user_var, width=26).grid(row=0, column=1, sticky='ew', padx=(0, 10))
+        ttk.Label(form, text="Сокращение:").grid(row=0, column=2, sticky='e', padx=(0, 4))
+        self._um_abbr_var = tk.StringVar()
+        ttk.Entry(form, textvariable=self._um_abbr_var, width=12).grid(row=0, column=3, sticky='ew')
+
+        btns = ttk.Frame(f)
+        btns.grid(row=3, column=0, pady=4)
+        ttk.Button(btns, text="Добавить / обновить", command=self._um_add).pack(side='left', padx=4)
+        ttk.Button(btns, text="Удалить выбранную",   command=self._um_remove).pack(side='left', padx=4)
+        ttk.Button(btns, text="Подставить мой логин",
+                   command=lambda: self._um_user_var.set(getpass.getuser())).pack(side='left', padx=4)
+
+        self._um_load_table()
+
+    def _refresh_cur_abbr(self):
+        if hasattr(self, '_cur_abbr_lbl'):
+            self._cur_abbr_lbl.config(text=get_registrar_name())
+
+    def _um_load_table(self):
+        for item in self._um_tree.get_children():
+            self._um_tree.delete(item)
+        for uname, abbr in _settings.get('user_map', {}).items():
+            self._um_tree.insert('', 'end', values=(uname, abbr))
+
+    def _on_um_select(self, _=None):
+        sel = self._um_tree.selection()
+        if sel:
+            v = self._um_tree.item(sel[0], 'values')
+            self._um_user_var.set(v[0]); self._um_abbr_var.set(v[1])
+
+    def _um_add(self):
+        uname = self._um_user_var.get().strip()
+        abbr  = self._um_abbr_var.get().strip()
+        if not uname or not abbr:
+            messagebox.showwarning("Внимание", "Заполните оба поля.", parent=self); return
+        _settings.setdefault('user_map', {})[uname] = abbr
+        self._um_load_table(); self._refresh_cur_abbr()
+
+    def _um_remove(self):
+        sel = self._um_tree.selection()
+        if sel:
+            uname = self._um_tree.item(sel[0], 'values')[0]
+            _settings.get('user_map', {}).pop(uname, None)
+            self._um_load_table(); self._refresh_cur_abbr()
+
+    # ── Вкладка: сокращения организаций ──────────────────────────────────
+
+    def _build_orgs_tab(self, f):
+        f.columnconfigure(0, weight=1)
+        f.rowconfigure(1, weight=1)
+        ttk.Label(f, text="Формат:  Полное название организации = Сокращение",
+                  foreground='gray').grid(row=0, column=0, sticky='w', pady=(0, 4))
+        txt_frame = ttk.Frame(f)
+        txt_frame.grid(row=1, column=0, sticky='nsew')
+        txt_frame.columnconfigure(0, weight=1)
+        txt_frame.rowconfigure(0, weight=1)
+        self._abbr_text = tk.Text(txt_frame, width=72, height=18, wrap='none', font=('Consolas', 9))
+        sb_v = ttk.Scrollbar(txt_frame, orient='vertical',   command=self._abbr_text.yview)
+        sb_h = ttk.Scrollbar(txt_frame, orient='horizontal', command=self._abbr_text.xview)
+        self._abbr_text.configure(yscrollcommand=sb_v.set, xscrollcommand=sb_h.set)
+        self._abbr_text.grid(row=0, column=0, sticky='nsew')
+        sb_v.grid(row=0, column=1, sticky='ns')
+        sb_h.grid(row=1, column=0, sticky='ew')
+        for key, val in _settings.get('org_abbreviations', {}).items():
+            self._abbr_text.insert('end', f"{key} = {val}\n")
+
+    # ── Вкладка: прочее ───────────────────────────────────────────────────
+
+    def _build_misc_tab(self, f):
         f.columnconfigure(1, weight=1)
-        f.rowconfigure(8, weight=1)
-
-        # Имя регистратора
-        ttk.Label(f, text="Имя регистратора (столбец H входящих):").grid(
-            row=0, column=0, sticky='e', padx=(0, 6), pady=(0, 4))
-        self._reg_var = tk.StringVar(value=_settings.get('registrar_name', ''))
-        ttk.Entry(f, textvariable=self._reg_var, width=32).grid(
-            row=0, column=1, sticky='ew', pady=(0, 4))
-        ttk.Label(f, text="(Оставьте пустым — будет использоваться системное имя пользователя)",
-                  foreground='gray').grid(row=1, column=0, columnspan=2, sticky='w', pady=(0, 12))
-
-        # Путь к программе "Таблицы уставок"
         ttk.Label(f, text="Программа «Таблицы уставок» (.exe):").grid(
-            row=2, column=0, sticky='e', padx=(0, 6), pady=(0, 4))
+            row=0, column=0, sticky='e', padx=(0, 6), pady=(0, 4))
         exe_frame = ttk.Frame(f)
-        exe_frame.grid(row=2, column=1, sticky='ew', pady=(0, 4))
+        exe_frame.grid(row=0, column=1, sticky='ew', pady=(0, 4))
         exe_frame.columnconfigure(0, weight=1)
         self._ustavki_exe_var = tk.StringVar(value=_settings.get('ustavki_exe_path', ''))
         ttk.Entry(exe_frame, textvariable=self._ustavki_exe_var).grid(row=0, column=0, sticky='ew')
         ttk.Button(exe_frame, text="…", width=3,
                    command=self._browse_ustavki_exe).grid(row=0, column=1, padx=(4, 0))
         ttk.Label(f, text="(путь к 2_UstavkiFolders.exe — для кнопки «→ Таблицы уставок»)",
-                  foreground='gray').grid(row=3, column=0, columnspan=2, sticky='w', pady=(0, 12))
-
-        # Сокращения организаций
-        ttk.Label(f, text="Сокращения организаций:").grid(
-            row=4, column=0, columnspan=2, sticky='w', pady=(0, 2))
-        ttk.Label(f, text="Формат:  Полное название организации = Сокращение",
-                  foreground='gray').grid(row=5, column=0, columnspan=2, sticky='w', pady=(0, 4))
-
-        txt_frame = ttk.Frame(f)
-        txt_frame.grid(row=6, column=0, columnspan=2, sticky='nsew', pady=(0, 8))
-        txt_frame.columnconfigure(0, weight=1)
-        txt_frame.rowconfigure(0, weight=1)
-
-        self._abbr_text = tk.Text(txt_frame, width=72, height=18, wrap='none',
-                                   font=('Consolas', 9))
-        sb_v = ttk.Scrollbar(txt_frame, orient='vertical', command=self._abbr_text.yview)
-        sb_h = ttk.Scrollbar(txt_frame, orient='horizontal', command=self._abbr_text.xview)
-        self._abbr_text.configure(yscrollcommand=sb_v.set, xscrollcommand=sb_h.set)
-        self._abbr_text.grid(row=0, column=0, sticky='nsew')
-        sb_v.grid(row=0, column=1, sticky='ns')
-        sb_h.grid(row=1, column=0, sticky='ew')
-
-        # Заполняем из словаря
-        abbrs = _settings.get('org_abbreviations', {})
-        for key, val in abbrs.items():
-            self._abbr_text.insert('end', f"{key} = {val}\n")
-
-        # Кнопки
-        btn_frame = ttk.Frame(f)
-        btn_frame.grid(row=7, column=0, columnspan=2, pady=(4, 0))
-        ttk.Button(btn_frame, text="Сохранить", command=self._save).pack(side='left', padx=6)
-        ttk.Button(btn_frame, text="Отмена", command=self.destroy).pack(side='left', padx=6)
+                  foreground='gray').grid(row=1, column=0, columnspan=2, sticky='w', pady=(0, 12))
 
     def _browse_ustavki_exe(self):
         path = filedialog.askopenfilename(
@@ -460,20 +632,20 @@ class SettingsWindow(tk.Toplevel):
             self._ustavki_exe_var.set(path)
 
     def _save(self):
+        # org_abbreviations из текстового поля
         lines = self._abbr_text.get('1.0', 'end').strip().splitlines()
         abbrs = {}
         for line in lines:
             line = line.strip()
-            if not line or line.startswith('#'):
-                continue
+            if not line or line.startswith('#'): continue
             if '=' in line:
                 key, _, val = line.partition('=')
                 key, val = key.strip(), val.strip()
                 if key and val:
                     abbrs[key] = val
         _settings['org_abbreviations'] = abbrs
-        _settings['registrar_name'] = self._reg_var.get().strip()
-        _settings['ustavki_exe_path'] = self._ustavki_exe_var.get().strip()
+        _settings['ustavki_exe_path']  = self._ustavki_exe_var.get().strip()
+        # user_map уже обновляется в _um_add/_um_remove напрямую
         save_settings()
         self.destroy()
 
@@ -483,6 +655,7 @@ class RegistrationApp(tk.Tk):
 
     def __init__(self):
         super().__init__()
+        self._watcher = ViewDirWatcher()
         self.in_data  = {}
         self.out_data = {}
         self._in_preview_vars  = {}
@@ -526,7 +699,7 @@ class RegistrationApp(tk.Tk):
         btn_frame.grid(row=2, column=0, pady=4)
         ttk.Button(btn_frame, text="Зарегистрировать в журнал",
                    command=self._on_register).pack(side='left', padx=6)
-        self._reparse_btn = ttk.Button(btn_frame, text="Считать из LanDocs заново",
+        self._reparse_btn = ttk.Button(btn_frame, text="Считать из LanDocs",
                                        command=self._start_reparse)
         self._reparse_btn.pack(side='left', padx=6)
         ttk.Button(btn_frame, text="→ Таблицы уставок",
@@ -698,6 +871,7 @@ class RegistrationApp(tk.Tk):
 
     def _start_reparse(self):
         self._reparse_btn.config(state='disabled')
+        self._watcher.reset()
         self.iconify()
         self._reparse_countdown(3)
 
@@ -751,7 +925,7 @@ class RegistrationApp(tk.Tk):
         # Определяем расширение: из ссылки LanDocs → ViewDir → .pdf
         ext = os.path.splitext(file_link)[1].lower() if file_link else ''
         if not ext:
-            latest = find_latest_in_viewdir()
+            latest = self._watcher.get_cached_path() or find_latest_in_viewdir()
             ext = os.path.splitext(latest)[1].lower() if latest else ''
         if not ext or ext not in LETTER_EXTS:
             ext = '.pdf'
@@ -790,14 +964,13 @@ class RegistrationApp(tk.Tk):
             signed_by = f"{signatory}\n{correspondent}" if correspondent else signatory
             hyperlink_path = self.in_save_path_var.get()
             if hyperlink_path:
-                src = find_latest_in_viewdir()
+                src = self._watcher.get_cached_path() or find_latest_in_viewdir()
                 if src:
                     shutil.copy2(src, hyperlink_path)
                 else:
                     raise FileNotFoundError(
                         "Файл письма не найден в ViewDir.\n"
                         r"Убедитесь, что письмо открыто в LanDocs (%LOCALAPPDATA%\Temp\ViewDir)")
-            registrar = _settings.get('registrar_name', '').strip() or getpass.getuser()
             write_to_excel_in({
                 'date':           fmt_date_ymd(d.get('date','')),
                 'incoming_num':   d.get('incoming_num',''),
@@ -806,11 +979,12 @@ class RegistrationApp(tk.Tk):
                 'author':         self.in_author_var.get(),
                 'signed_by':      signed_by,
                 'folder_num':     self.in_folder_num_var.get(),
-                'who_registered': registrar,
+                'who_registered': get_registrar_name(),
                 'keywords':       self.in_keywords_var.get(),
                 'related':        d.get('related',''),
                 'hyperlink_path': hyperlink_path,
             })
+            self._watcher.stop()
             messagebox.showinfo("Готово", "Запись добавлена в журнал!", parent=self)
         except Exception as exc:
             messagebox.showerror("Ошибка", str(exc), parent=self)
@@ -824,7 +998,7 @@ class RegistrationApp(tk.Tk):
             d = self.out_data
             hyperlink_path = self.out_save_path_var.get()
             if hyperlink_path:
-                src = find_latest_in_viewdir()
+                src = self._watcher.get_cached_path() or find_latest_in_viewdir()
                 if src:
                     shutil.copy2(src, hyperlink_path)
                 else:
@@ -841,6 +1015,7 @@ class RegistrationApp(tk.Tk):
                 'control':        self.out_control_var.get(),
                 'hyperlink_path': hyperlink_path,
             })
+            self._watcher.stop()
             messagebox.showinfo("Готово", "Запись добавлена в журнал!", parent=self)
         except Exception as exc:
             messagebox.showerror("Ошибка", str(exc), parent=self)
