@@ -1,7 +1,7 @@
 @echo off
 chcp 65001 > nul
 echo ============================================================
-echo  Сборка 2_UstavkiFolders.exe
+echo  Сборка LanDocs_Registrator.exe
 echo ============================================================
 echo.
 
@@ -33,11 +33,11 @@ echo  Найден: %TKDND_PATH%
 
 :: Собираем exe
 echo.
-echo [3/5] Сборка 2_UstavkiFolders.exe через PyInstaller...
+echo [3/5] Сборка LanDocs_Registrator.exe через PyInstaller...
 pyinstaller ^
     --onefile ^
     --windowed ^
-    --name "2_UstavkiFolders" ^
+    --name "LanDocs_Registrator" ^
     --add-data "%TKDND_PATH%;tkinterdnd2" ^
     --hidden-import "tkinterdnd2" ^
     --hidden-import "docx" ^
@@ -46,7 +46,7 @@ pyinstaller ^
     --hidden-import "pyautogui" ^
     --hidden-import "win32com.client" ^
     --hidden-import "win32clipboard" ^
-    2_ustavki_folders.py
+    landocs_register.py
 
 if errorlevel 1 (
     echo ОШИБКА: Сборка не удалась. Смотрите лог выше.
@@ -61,18 +61,19 @@ if exist "yandexdriver.exe" (
     copy /y "yandexdriver.exe" "dist\yandexdriver.exe" >nul
     echo  Скопирован yandexdriver.exe в dist\
 ) else (
-    echo  ВНИМАНИЕ: yandexdriver.exe не найден в текущей папке.
-    echo  Скачайте с https://yandex.ru/dev/yandexdriver/ и положите рядом с exe.
+    echo  ВНИМАНИЕ: yandexdriver.exe не найден. Нужен только для вкладки "7 ДЭБ".
 )
 
 echo.
 echo [5/5] Готово!
 echo.
-echo  Исполняемый файл: dist\2_UstavkiFolders.exe
+echo  Исполняемый файл: dist\LanDocs_Registrator.exe
+echo.
+echo  Для сетевого диска: скопируйте dist\LanDocs_Registrator.exe на сетевой диск.
+echo  settings.json будет создан автоматически рядом с exe при первом сохранении настроек.
 echo.
 echo  ВАЖНО: для работы вкладки "7 ДЭБ" необходимо:
 echo   - yandexdriver.exe рядом с exe
-echo     (скачать: https://yandex.ru/dev/yandexdriver/)
-echo   - Яндекс Браузер установлен (уже есть на целевом ПК)
+echo   - Яндекс Браузер установлен на целевом ПК
 echo.
 pause
